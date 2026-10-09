@@ -1,0 +1,35 @@
+{
+  "title": "FusionEdge",
+  "config": {
+    "step": {
+      "confirm": {
+        "title": "Add {name}",
+        "description": "Add this FusionEdge radio using its MQTT connection?"
+      }
+    },
+    "abort": {
+      "already_configured": "This radio is already configured",
+      "discovery_required": "Start the radio with MQTT enabled and wait for it to appear under Discovered devices",
+      "invalid_discovery": "The FusionEdge MQTT advertisement is invalid"
+    }
+  },
+  "entity": {
+    "select": {
+      "bluetooth_output": {"name": "Bluetooth output"}
+    },
+    "switch": {
+      "clock_tts": {"name": "Clock TTS"},
+      "clock_tts_no_stream": {"name": "Only when no audio is playing"},
+      "led_strip_screensaver": {"name": "LED strip during screensaver"}
+    },
+    "text": {
+      "timer_weekday_start": {"name": "Weekday turn on"},
+      "timer_weekday_stop": {"name": "Weekday turn off"},
+      "timer_weekend_start": {"name": "Weekend turn on"},
+      "timer_weekend_stop": {"name": "Weekend turn off"}
+    },
+    "light": {
+      "led_strip": {"name": "LED strip"}
+    }
+  }
+}

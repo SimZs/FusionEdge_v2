@@ -1,0 +1,1763 @@
+#include "coverart.h"
+
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <cJSON.h>
+#include <ctype.h>
+#include <esp_heap_caps.h>
+#include <freertos/idf_additions.h>
+#include <time.h>
+
+#include "config.h"
+#include "display.h"
+#ifdef USE_DLNA
+#    include "../dlna/dlna_http_guard.h"
+#endif
+
+namespace {
+
+constexpr size_t API_RESPONSE_LIMIT = 96 * 1024;
+constexpr size_t COVER_IMAGE_LIMIT  = 512 * 1024;
+constexpr size_t MUSICBRAINZ_CANDIDATE_LIMIT = 6;
+constexpr uint32_t REQUEST_SETTLE_MS = 3000;
+constexpr uint32_t MUSICBRAINZ_INTERVAL_MS = 1100;
+constexpr uint32_t COVER_CONNECT_TIMEOUT_MS = 6000;
+constexpr uint32_t COVER_READ_TIMEOUT_MS = 8000;
+constexpr char HTTP_USER_AGENT[] =
+    "FusionEdge/" FW_VERSION " (https://github.com/SimZs/FusionEdge)";
+
+bool lastFmConfigured() {
+    return config.store.lastFmEnabled &&
+           strlen(config.store.lastFmApiKey) == LASTFM_API_KEY_LENGTH - 1;
+}
+constexpr size_t LASTFM_CACHE_ENTRY_LIMIT = 4;
+constexpr size_t LASTFM_CACHE_BYTE_LIMIT = 256 * 1024;
+constexpr uint32_t CACHE_MAX_AGE_LIMIT_SECONDS = 7 * 24 * 60 * 60;
+
+uint32_t lastMusicBrainzRequestMs = 0;
+
+struct LastFmCacheEntry {
+    char* url = nullptr;
+    uint8_t* data = nullptr;
+    size_t size = 0;
+    uint32_t expiresAt = 0;
+    uint32_t lastUsed = 0;
+};
+
+LastFmCacheEntry lastFmCache[LASTFM_CACHE_ENTRY_LIMIT];
+size_t lastFmCacheBytes = 0;
+uint32_t lastFmCacheUseSerial = 0;
+
+enum class CoverSource : uint8_t {
+    CaaLastFmMbid,
+    CaaMusicBrainz,
+};
+
+struct CoverSourceStats {
+    uint32_t caaLastFmMbid = 0;
+    uint32_t caaMusicBrainz = 0;
+};
+
+CoverSourceStats coverSourceStats;
+
+struct MbidCandidates {
+    char ids[MUSICBRAINZ_CANDIDATE_LIMIT][40]{};
+    size_t count = 0;
+
+    void add(const char* id) {
+        if (!id || count >= MUSICBRAINZ_CANDIDATE_LIMIT) return;
+        for (size_t i = 0; i < count; ++i) {
+            if (strcmp(ids[i], id) == 0) return;
+        }
+        strlcpy(ids[count++], id, sizeof(ids[0]));
+    }
+};
+
+void* cJsonPsramMalloc(size_t size) {
+    return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+}
+
+void cJsonPsramFree(void* pointer) {
+    free(pointer);
+}
+
+class PsramBufferStream : public Stream {
+  public:
+    explicit PsramBufferStream(size_t capacity)
+        : _capacity(capacity), _data(static_cast<uint8_t*>(ps_malloc(capacity + 1))) {}
+
+    ~PsramBufferStream() override {
+        if (_data) free(_data);
+    }
+
+    size_t write(uint8_t value) override { return write(&value, 1); }
+
+    size_t write(const uint8_t* buffer, size_t size) override {
+        if (!_data || !buffer || size > _capacity - _size) return 0;
+        memcpy(_data + _size, buffer, size);
+        _size += size;
+        return size;
+    }
+
+    int available() override { return 0; }
+    int read() override { return -1; }
+    int peek() override { return -1; }
+    void flush() override {}
+
+    bool valid() const { return _data != nullptr; }
+    size_t size() const { return _size; }
+
+    uint8_t* release() {
+        if (!_data) return nullptr;
+        _data[_size] = 0;
+        uint8_t* result = _data;
+        _data = nullptr;
+        return result;
+    }
+
+  private:
+    size_t   _capacity;
+    size_t   _size = 0;
+    uint8_t* _data;
+};
+
+class CooperativeNetworkClient : public NetworkClient {
+  public:
+    int connect(IPAddress ip, uint16_t port, int32_t timeoutMs) override {
+        if (!_serviceNetwork()) return 0;
+        return NetworkClient::connect(ip, port, _boundedConnectTimeout(timeoutMs));
+    }
+
+    int connect(const char* host, uint16_t port, int32_t timeoutMs) override {
+        if (!_serviceNetwork()) return 0;
+        return NetworkClient::connect(host, port, _boundedConnectTimeout(timeoutMs));
+    }
+
+    int available() override {
+        if (!_serviceNetwork()) return 0;
+        return NetworkClient::available();
+    }
+
+    int read() override {
+        if (!_serviceNetwork()) return -1;
+        uint8_t value = 0;
+        const int result = NetworkClient::read(&value, 1);
+        if (result < 0) return result;
+        return result == 0 ? -1 : value;
+    }
+
+    int read(uint8_t* buffer, size_t size) override {
+        if (!_serviceNetwork()) return -1;
+        return NetworkClient::read(buffer, size);
+    }
+
+    uint8_t connected() override {
+        if (!_serviceNetwork()) return 0;
+        return NetworkClient::connected();
+    }
+
+  private:
+    static int32_t _boundedConnectTimeout(int32_t requestedMs) {
+        constexpr int32_t maxCoverConnectMs = 3000;
+        return requestedMs <= 0 || requestedMs > maxCoverConnectMs
+            ? maxCoverConnectMs
+            : requestedMs;
+    }
+
+    bool _serviceNetwork() {
+        if (coverArt.networkPaused() || WiFi.status() != WL_CONNECTED) {
+            NetworkClient::stop();
+            return false;
+        }
+
+        // HTTPClient reads response headers byte-by-byte. A malformed or very
+        // long line can otherwise keep CPU0 away from IDLE0 until the task WDT
+        // fires. Yield by elapsed time instead of operation count: yielding
+        // every few bytes made larger HTTP headers hit the read timeout.
+        const uint32_t now = millis();
+        if (now - _lastYieldMs >= 20U) {
+            _lastYieldMs = now;
+            vTaskDelay(1);
+        }
+        return true;
+    }
+
+    uint32_t _lastYieldMs = 0;
+};
+
+char* trim(char* text) {
+    if (!text) return text;
+    while (*text && isspace(static_cast<unsigned char>(*text))) ++text;
+    char* end = text + strlen(text);
+    while (end > text && isspace(static_cast<unsigned char>(end[-1]))) --end;
+    *end = '\0';
+    return text;
+}
+
+bool readUtf8CodePoint(const char*& input, uint32_t& codePoint) {
+    const auto* bytes = reinterpret_cast<const unsigned char*>(input);
+    if (bytes[0] < 0x80) {
+        codePoint = bytes[0];
+        ++input;
+        return true;
+    }
+
+    size_t length = 0;
+    uint32_t value = 0;
+    if ((bytes[0] & 0xE0) == 0xC0) {
+        length = 2;
+        value = bytes[0] & 0x1F;
+    } else if ((bytes[0] & 0xF0) == 0xE0) {
+        length = 3;
+        value = bytes[0] & 0x0F;
+    } else if ((bytes[0] & 0xF8) == 0xF0) {
+        length = 4;
+        value = bytes[0] & 0x07;
+    } else {
+        codePoint = bytes[0];
+        ++input;
+        return false;
+    }
+
+    for (size_t index = 1; index < length; ++index) {
+        if (bytes[index] == 0 || (bytes[index] & 0xC0) != 0x80) {
+            codePoint = bytes[0];
+            ++input;
+            return false;
+        }
+        value = (value << 6) | (bytes[index] & 0x3F);
+    }
+
+    const bool overlong = (length == 2 && value < 0x80) ||
+                          (length == 3 && value < 0x800) ||
+                          (length == 4 && value < 0x10000);
+    if (overlong || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) {
+        codePoint = bytes[0];
+        ++input;
+        return false;
+    }
+
+    codePoint = value;
+    input += length;
+    return true;
+}
+
+size_t utf8CodePointSize(uint32_t codePoint) {
+    if (codePoint < 0x80) return 1;
+    if (codePoint < 0x800) return 2;
+    if (codePoint < 0x10000) return 3;
+    return 4;
+}
+
+void appendUtf8CodePoint(uint32_t codePoint, char* output, size_t& out) {
+    if (codePoint < 0x80) {
+        output[out++] = static_cast<char>(codePoint);
+    } else if (codePoint < 0x800) {
+        output[out++] = static_cast<char>(0xC0 | (codePoint >> 6));
+        output[out++] = static_cast<char>(0x80 | (codePoint & 0x3F));
+    } else if (codePoint < 0x10000) {
+        output[out++] = static_cast<char>(0xE0 | (codePoint >> 12));
+        output[out++] = static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
+        output[out++] = static_cast<char>(0x80 | (codePoint & 0x3F));
+    } else {
+        output[out++] = static_cast<char>(0xF0 | (codePoint >> 18));
+        output[out++] = static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F));
+        output[out++] = static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F));
+        output[out++] = static_cast<char>(0x80 | (codePoint & 0x3F));
+    }
+}
+
+uint32_t lowerComparisonCodePoint(uint32_t codePoint) {
+    if (codePoint >= 'A' && codePoint <= 'Z') return codePoint + ('a' - 'A');
+    if (codePoint >= 0x0410 && codePoint <= 0x042F) return codePoint + 0x20;
+
+    switch (codePoint) {
+        case 0x0401: return 0x0451; // Cyrillic IO
+        case 0x0404: return 0x0454; // Ukrainian IE
+        case 0x0406: return 0x0456; // Ukrainian I
+        case 0x0407: return 0x0457; // Ukrainian YI
+        case 0x040E: return 0x045E; // Cyrillic short U
+        case 0x0490: return 0x0491; // Ukrainian GHE with upturn
+        default: return codePoint;
+    }
+}
+
+bool isComparisonSeparator(uint32_t codePoint) {
+    if (codePoint < 0x80) {
+        return isspace(static_cast<unsigned char>(codePoint)) ||
+               ispunct(static_cast<unsigned char>(codePoint));
+    }
+
+    return codePoint == 0x00A0 || codePoint == 0x00A9 || codePoint == 0x00AB ||
+           codePoint == 0x00AE || codePoint == 0x00B7 || codePoint == 0x00BB ||
+           (codePoint >= 0x2000 && codePoint <= 0x200B) ||
+           (codePoint >= 0x2010 && codePoint <= 0x2027) ||
+           (codePoint >= 0x2032 && codePoint <= 0x2037) ||
+           codePoint == 0x2039 || codePoint == 0x203A || codePoint == 0x2043 ||
+           codePoint == 0x202F || codePoint == 0x205F || codePoint == 0x2122 ||
+           codePoint == 0x2212 || codePoint == 0x3000;
+}
+
+void normalizeKeyPart(const char* input, char* output, size_t outputSize) {
+    if (!output || outputSize == 0) return;
+    output[0] = '\0';
+    if (!input) return;
+
+    size_t out = 0;
+    bool pendingSpace = false;
+    while (*input) {
+        uint32_t codePoint = 0;
+        const bool validUtf8 = readUtf8CodePoint(input, codePoint);
+        if (validUtf8 && isComparisonSeparator(codePoint)) {
+            pendingSpace = out > 0;
+            continue;
+        }
+
+        codePoint = validUtf8 ? lowerComparisonCodePoint(codePoint) : codePoint;
+        const size_t codePointSize = validUtf8 ? utf8CodePointSize(codePoint) : 1;
+        const size_t spaceSize = pendingSpace && out > 0 ? 1 : 0;
+        if (out + spaceSize + codePointSize >= outputSize) break;
+
+        if (spaceSize != 0) output[out++] = ' ';
+        pendingSpace = false;
+        if (validUtf8) {
+            appendUtf8CodePoint(codePoint, output, out);
+        } else {
+            output[out++] = static_cast<char>(codePoint);
+        }
+    }
+    output[out] = '\0';
+}
+
+bool isTrailingTechnicalId(const char* text) {
+    bool hasDigit = false;
+    for (const unsigned char* cursor = reinterpret_cast<const unsigned char*>(text);
+         cursor && *cursor; ++cursor) {
+        if (isdigit(*cursor)) {
+            hasDigit = true;
+        } else if (!isspace(*cursor) && !ispunct(*cursor)) {
+            return false;
+        }
+    }
+    return hasDigit;
+}
+
+void cleanTrackTitleForSearch(const char* input, char* output, size_t outputSize) {
+    if (!output || outputSize == 0) return;
+    strlcpy(output, input ? input : "", outputSize);
+
+    char* suffix = strrchr(output, ';');
+    if (suffix && isTrailingTechnicalId(suffix + 1)) *suffix = '\0';
+
+    char* clean = trim(output);
+    if (clean != output) memmove(output, clean, strlen(clean) + 1);
+}
+
+void normalizeTrackTitle(const char* input, char* output, size_t outputSize) {
+    char cleaned[256];
+    cleanTrackTitleForSearch(input, cleaned, sizeof(cleaned));
+    normalizeKeyPart(cleaned, output, outputSize);
+}
+
+bool splitCombinedTitle(const char* combined, char* artist, size_t artistSize,
+                        char* title, size_t titleSize) {
+    if (!combined || !artist || !title || artistSize == 0 || titleSize == 0) return false;
+    const char* separator = strstr(combined, " - ");
+    if (!separator) return false;
+
+    const size_t artistLength = static_cast<size_t>(separator - combined);
+    if (artistLength == 0 || artistLength >= artistSize) return false;
+    memcpy(artist, combined, artistLength);
+    artist[artistLength] = '\0';
+    strlcpy(title, separator + 3, titleSize);
+
+    char* cleanArtist = trim(artist);
+    char* cleanTitle  = trim(title);
+    if (cleanArtist != artist) memmove(artist, cleanArtist, strlen(cleanArtist) + 1);
+    if (cleanTitle != title) memmove(title, cleanTitle, strlen(cleanTitle) + 1);
+    return artist[0] != '\0' && title[0] != '\0';
+}
+
+void makeKey(const char* artist, const char* title, char* key, size_t keySize) {
+    char normalizedArtist[128];
+    char normalizedTitle[192];
+    normalizeKeyPart(artist, normalizedArtist, sizeof(normalizedArtist));
+    normalizeTrackTitle(title, normalizedTitle, sizeof(normalizedTitle));
+    snprintf(key, keySize, "%s\x1f%s", normalizedArtist, normalizedTitle);
+}
+
+char* findAsciiCaseInsensitive(char* text, const char* needle) {
+    if (!text || !needle || *needle == '\0') return text;
+    const size_t needleLength = strlen(needle);
+    for (char* start = text; *start; ++start) {
+        size_t index = 0;
+        while (index < needleLength && start[index] &&
+               tolower(static_cast<unsigned char>(start[index])) ==
+                   tolower(static_cast<unsigned char>(needle[index]))) {
+            ++index;
+        }
+        if (index == needleLength) return start;
+    }
+    return nullptr;
+}
+
+void makeMusicBrainzSearchPart(const char* input, char* output, size_t outputSize,
+                               bool removeFeaturedArtist) {
+    if (!output || outputSize == 0) return;
+    strlcpy(output, input ? input : "", outputSize);
+
+    if (removeFeaturedArtist) {
+        static const char* const markers[] = {
+            " feat. ", " feat ", " ft. ", " ft ", " featuring ", " (feat.", " (feat "
+        };
+        for (const char* marker : markers) {
+            char* position = findAsciiCaseInsensitive(output, marker);
+            if (position) {
+                *position = '\0';
+                break;
+            }
+        }
+    }
+
+    for (char* cursor = output; *cursor; ++cursor) {
+        if (*cursor == '"') *cursor = ' ';
+    }
+    char* clean = trim(output);
+    if (clean != output) memmove(output, clean, strlen(clean) + 1);
+}
+
+bool containsVideoNoise(char* text) {
+    static const char* const words[] = {
+        "lyric", "official", "video", "audio", "full hd", "4k",
+        "visualizer", "karaoke", "sing-along", "sing along", "remix"
+    };
+    for (const char* word : words) {
+        if (findAsciiCaseInsensitive(text, word)) return true;
+    }
+    return false;
+}
+
+void canonicalizeBluetoothTrackTitle(char* text) {
+    if (!text || text[0] == '\0') return;
+
+    // Remove bracketed video descriptors while preserving genuine title
+    // qualifiers such as artist names when they do not contain a noise word.
+    for (char* cursor = text; *cursor;) {
+        char* openRound = strchr(cursor, '(');
+        char* openSquare = strchr(cursor, '[');
+        char* open = !openRound ? openSquare
+                   : !openSquare ? openRound
+                   : (openRound < openSquare ? openRound : openSquare);
+        if (!open) break;
+        const char closing = *open == '(' ? ')' : ']';
+        char* close = strchr(open + 1, closing);
+        if (!close) break;
+
+        const char saved = *close;
+        *close = '\0';
+        const bool remove = containsVideoNoise(open + 1);
+        *close = saved;
+        if (remove) {
+            memmove(open, close + 1, strlen(close + 1) + 1);
+            cursor = open;
+        } else {
+            cursor = close + 1;
+        }
+    }
+
+    static const char* const suffixes[] = {
+        " with lyrics", " lyrics", " lyric video", " official video",
+        " official audio", " live video", " music video", " full video",
+        " full hd", " visualizer", " karaoke", " sing-along", " sing along"
+    };
+    char* firstSuffix = nullptr;
+    for (const char* suffix : suffixes) {
+        char* found = findAsciiCaseInsensitive(text, suffix);
+        if (found && (!firstSuffix || found < firstSuffix)) firstSuffix = found;
+    }
+    const bool removedSuffix = firstSuffix != nullptr;
+    if (firstSuffix) *firstSuffix = '\0';
+
+    char* clean = trim(text);
+    if (clean != text) memmove(text, clean, strlen(clean) + 1);
+
+    // A year immediately before a removed video suffix is also only a video
+    // qualifier. Keep genuine titles ending in a year unchanged.
+    char* end = text + strlen(text);
+    char* lastSpace = strrchr(text, ' ');
+    if (removedSuffix && lastSpace && end - lastSpace == 5) {
+        bool year = true;
+        for (char* p = lastSpace + 1; p < end; ++p) {
+            if (!isdigit(static_cast<unsigned char>(*p))) { year = false; break; }
+        }
+        if (year) *lastSpace = '\0';
+    }
+
+    static const char* const unavailable[] = {
+        "not provided", "unknown", "n/a", "no title", "untitled"
+    };
+    for (const char* value : unavailable) {
+        if (strcasecmp(text, value) == 0) {
+            text[0] = '\0';
+            return;
+        }
+    }
+}
+
+void makeBluetoothTrackIdentity(const char* input, char* output, size_t outputSize) {
+    if (!output || outputSize == 0) return;
+    strlcpy(output, input ? input : "", outputSize);
+
+    char* clean = trim(output);
+    if (clean != output) memmove(output, clean, strlen(clean) + 1);
+    canonicalizeBluetoothTrackTitle(output);
+}
+
+void makeBluetoothTrackSearch(const char* input, char* output, size_t outputSize) {
+    makeBluetoothTrackIdentity(input, output, outputSize);
+    if (!output || output[0] == '\0') return;
+
+    // Most YouTube titles use "Track | video qualifier", but some music
+    // channels use "Artist list | Track title". A bullet-separated left side
+    // is a strong signal for the latter form. Keep the full string for track
+    // identity, and choose only the likely title segment for network search.
+    char* pipe = strstr(output, " | ");
+    size_t pipeLength = 3;
+    if (!pipe) {
+        pipe = strchr(output, '|');
+        pipeLength = 1;
+    }
+    if (pipe) {
+        char* right = pipe + pipeLength;
+        *pipe = '\0';
+        char* leftClean = trim(output);
+        char* rightClean = trim(right);
+        const bool artistListOnLeft =
+            strstr(leftClean, "\xE2\x80\xA2") != nullptr;
+        const bool useRight = artistListOnLeft && rightClean[0] != '\0' &&
+                              !containsVideoNoise(rightClean);
+        const char* selected = useRight ? rightClean : leftClean;
+        if (selected != output) {
+            memmove(output, selected, strlen(selected) + 1);
+        }
+    }
+
+    // ASCII "Artist - Track" has already been separated by
+    // splitCombinedTitle(). Do not peel off another ASCII dash here: mix
+    // names such as "Best of ... - Tears For Fears" would otherwise turn
+    // into an unrelated single-artist lookup. Only typographic dashes, which
+    // splitCombinedTitle() does not recognize, are handled here.
+    static const char* const separators[] = {
+        " \xE2\x80\x93 ", " \xE2\x80\x94 "
+    };
+    char* splitAt = nullptr;
+    size_t separatorLength = 0;
+    for (const char* separator : separators) {
+        char* found = strstr(output, separator);
+        const bool unique = found &&
+            strstr(found + strlen(separator), separator) == nullptr;
+        if (unique && (!splitAt || found < splitAt)) {
+            splitAt = found;
+            separatorLength = strlen(separator);
+        }
+    }
+    if (splitAt && splitAt[separatorLength] != '\0') {
+        memmove(output, splitAt + separatorLength,
+                strlen(splitAt + separatorLength) + 1);
+    }
+
+    char* clean = trim(output);
+    if (clean != output) memmove(output, clean, strlen(clean) + 1);
+}
+
+bool makeLookupKey(const char* artist, const char* title, bool bluetoothTitleMode,
+                   char* key, size_t keySize) {
+    if (!bluetoothTitleMode) {
+        makeKey(artist, title, key, keySize);
+        return key[0] != '\0';
+    }
+
+    // QCC's ARTS field may change from one YouTube channel name to another
+    // while TITL still describes the same playing item. Use only the cleaned
+    // title as the BT identity so a late metadata update cannot restart an
+    // already successful cover lookup.
+    char trackIdentity[192];
+    makeBluetoothTrackIdentity(title, trackIdentity, sizeof(trackIdentity));
+    if (trackIdentity[0] == '\0') {
+        key[0] = '\0';
+        return false;
+    }
+    makeKey("", trackIdentity, key, keySize);
+    return true;
+}
+
+String urlEncode(const char* value) {
+    static const char hex[] = "0123456789ABCDEF";
+    String result;
+    if (!value) return result;
+    result.reserve(strlen(value) * 3 + 1);
+    while (*value) {
+        const uint8_t ch = static_cast<uint8_t>(*value++);
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
+            result += static_cast<char>(ch);
+        } else {
+            result += '%';
+            result += hex[ch >> 4];
+            result += hex[ch & 0x0F];
+        }
+    }
+    return result;
+}
+
+String requestHost(const String& url) {
+    const int schemeEnd = url.indexOf("://");
+    const int hostStart = schemeEnd >= 0 ? schemeEnd + 3 : 0;
+    int hostEnd = url.indexOf('/', hostStart);
+    if (hostEnd < 0) hostEnd = url.length();
+    return url.substring(hostStart, hostEnd);
+}
+
+bool isLastFmApiUrl(const String& url) {
+    return url.startsWith("http://ws.audioscrobbler.com/2.0/");
+}
+
+void clearLastFmCacheEntry(LastFmCacheEntry& entry) {
+    if (entry.data) {
+        lastFmCacheBytes = entry.size <= lastFmCacheBytes
+            ? lastFmCacheBytes - entry.size
+            : 0;
+        free(entry.data);
+    }
+    if (entry.url) free(entry.url);
+    entry.url = nullptr;
+    entry.data = nullptr;
+    entry.size = 0;
+    entry.expiresAt = 0;
+    entry.lastUsed = 0;
+}
+
+LastFmCacheEntry* oldestLastFmCacheEntry() {
+    LastFmCacheEntry* oldest = nullptr;
+    for (auto& entry : lastFmCache) {
+        if (!entry.data) continue;
+        if (!oldest || entry.lastUsed < oldest->lastUsed) oldest = &entry;
+    }
+    return oldest;
+}
+
+bool copyLastFmCachedResponse(const String& url, uint8_t*& data, size_t& size) {
+    const uint32_t now = millis();
+    for (auto& entry : lastFmCache) {
+        if (!entry.url || strcmp(entry.url, url.c_str()) != 0) continue;
+        if (static_cast<int32_t>(now - entry.expiresAt) >= 0) {
+            clearLastFmCacheEntry(entry);
+            return false;
+        }
+
+        auto* copy = static_cast<uint8_t*>(ps_malloc(entry.size + 1));
+        if (!copy) return false;
+        memcpy(copy, entry.data, entry.size);
+        copy[entry.size] = 0;
+        data = copy;
+        size = entry.size;
+        if (++lastFmCacheUseSerial == 0) ++lastFmCacheUseSerial;
+        entry.lastUsed = lastFmCacheUseSerial;
+        log_d("##[COVERCACHE]# Last.fm metadata hit (%u bytes)",
+              static_cast<unsigned>(size));
+        return true;
+    }
+    return false;
+}
+
+void storeLastFmCachedResponse(const String& url, const uint8_t* data, size_t size,
+                               uint32_t maxAgeSeconds) {
+    if (!data || size == 0 || size > LASTFM_CACHE_BYTE_LIMIT || maxAgeSeconds == 0) return;
+
+    const size_t urlSize = url.length() + 1;
+    auto* cachedUrl = static_cast<char*>(ps_malloc(urlSize));
+    auto* cachedData = static_cast<uint8_t*>(ps_malloc(size + 1));
+    if (!cachedUrl || !cachedData) {
+        if (cachedUrl) free(cachedUrl);
+        if (cachedData) free(cachedData);
+        return;
+    }
+    memcpy(cachedUrl, url.c_str(), urlSize);
+    memcpy(cachedData, data, size);
+    cachedData[size] = 0;
+
+    LastFmCacheEntry* slot = nullptr;
+    for (auto& entry : lastFmCache) {
+        if (entry.url && strcmp(entry.url, url.c_str()) == 0) {
+            clearLastFmCacheEntry(entry);
+            slot = &entry;
+            break;
+        }
+        if (!slot && !entry.data) slot = &entry;
+    }
+    if (!slot) {
+        slot = oldestLastFmCacheEntry();
+        if (slot) clearLastFmCacheEntry(*slot);
+    }
+    while (lastFmCacheBytes + size > LASTFM_CACHE_BYTE_LIMIT) {
+        LastFmCacheEntry* oldest = oldestLastFmCacheEntry();
+        if (!oldest) break;
+        clearLastFmCacheEntry(*oldest);
+    }
+    if (!slot) {
+        for (auto& entry : lastFmCache) {
+            if (!entry.data) {
+                slot = &entry;
+                break;
+            }
+        }
+    }
+    if (!slot || lastFmCacheBytes + size > LASTFM_CACHE_BYTE_LIMIT) {
+        free(cachedUrl);
+        free(cachedData);
+        return;
+    }
+
+    maxAgeSeconds = min<uint32_t>(maxAgeSeconds, CACHE_MAX_AGE_LIMIT_SECONDS);
+    if (++lastFmCacheUseSerial == 0) ++lastFmCacheUseSerial;
+    slot->url = cachedUrl;
+    slot->data = cachedData;
+    slot->size = size;
+    slot->expiresAt = millis() + maxAgeSeconds * 1000UL;
+    slot->lastUsed = lastFmCacheUseSerial;
+    lastFmCacheBytes += size;
+    log_d("##[COVERCACHE]# Last.fm metadata stored (%u bytes, max-age=%lu)",
+          static_cast<unsigned>(size), static_cast<unsigned long>(maxAgeSeconds));
+}
+
+bool parseHttpDate(const String& value, time_t& result) {
+    if (value.length() == 0) return false;
+    struct tm parsed{};
+    parsed.tm_isdst = -1;
+    if (!strptime(value.c_str(), "%a, %d %b %Y %H:%M:%S", &parsed)) return false;
+    result = mktime(&parsed);
+    return result != static_cast<time_t>(-1);
+}
+
+uint32_t responseFreshnessSeconds(const String& cacheControl,
+                                  const String& date, const String& expires) {
+    String directives = cacheControl;
+    directives.toLowerCase();
+    if (directives.indexOf("no-store") >= 0 || directives.indexOf("no-cache") >= 0) {
+        return 0;
+    }
+
+    const int maxAgeAt = directives.indexOf("max-age=");
+    if (maxAgeAt >= 0) {
+        const char* cursor = directives.c_str() + maxAgeAt + 8;
+        uint32_t seconds = 0;
+        while (*cursor >= '0' && *cursor <= '9') {
+            if (seconds >= CACHE_MAX_AGE_LIMIT_SECONDS) {
+                seconds = CACHE_MAX_AGE_LIMIT_SECONDS;
+                break;
+            }
+            seconds = seconds * 10U + static_cast<uint32_t>(*cursor++ - '0');
+        }
+        return min<uint32_t>(seconds, CACHE_MAX_AGE_LIMIT_SECONDS);
+    }
+
+    time_t responseTime = 0;
+    time_t expirationTime = 0;
+    if (!parseHttpDate(date, responseTime) || !parseHttpDate(expires, expirationTime) ||
+        expirationTime <= responseTime) {
+        return 0;
+    }
+    const double lifetime = difftime(expirationTime, responseTime);
+    return min<uint32_t>(static_cast<uint32_t>(lifetime), CACHE_MAX_AGE_LIMIT_SECONDS);
+}
+
+void recordCoverSource(CoverSource source) {
+    [[maybe_unused]] const char* sourceName = nullptr;
+    switch (source) {
+        case CoverSource::CaaLastFmMbid:
+            ++coverSourceStats.caaLastFmMbid;
+            sourceName = "caa-lastfm-mbid";
+            break;
+        case CoverSource::CaaMusicBrainz:
+            ++coverSourceStats.caaMusicBrainz;
+            sourceName = "caa-musicbrainz";
+            break;
+    }
+    [[maybe_unused]] const uint32_t total = coverSourceStats.caaLastFmMbid +
+                           coverSourceStats.caaMusicBrainz;
+    log_i("##[COVERSTAT]# source=%s caa-lastfm-mbid=%lu "
+          "caa-musicbrainz=%lu total=%lu",
+          sourceName,
+          static_cast<unsigned long>(coverSourceStats.caaLastFmMbid),
+          static_cast<unsigned long>(coverSourceStats.caaMusicBrainz),
+          static_cast<unsigned long>(total));
+}
+
+bool httpGetToPsram(const String& url, size_t limit, uint8_t*& data, size_t& size,
+                    uint8_t retries = 1) {
+    data = nullptr;
+    size = 0;
+    if (coverArt.networkPaused()) return false;
+    const bool lastFmApiRequest = isLastFmApiUrl(url);
+    if (lastFmApiRequest && copyLastFmCachedResponse(url, data, size)) return true;
+    if (!url.startsWith("http://")) {
+        log_w("##[COVER]# non-HTTP URL rejected to preserve audio TLS memory");
+        return false;
+    }
+
+    for (uint8_t attempt = 0; attempt <= retries; ++attempt) {
+        if (coverArt.networkPaused()) return false;
+        bool retry = false;
+        {
+#ifdef USE_DLNA
+            // DLNA Browse and cover lookup both use sizeable HTTP responses.
+            // Keep them off the network heap at the same time.
+            DlnaHttpGuard dlnaHttpLock;
+#endif
+            if (coverArt.networkPaused()) return false;
+            CooperativeNetworkClient plainClient;
+            HTTPClient http;
+            http.setConnectTimeout(COVER_CONNECT_TIMEOUT_MS);
+            http.setTimeout(COVER_READ_TIMEOUT_MS);
+            http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            http.setRedirectLimit(4);
+            http.setUserAgent(HTTP_USER_AGENT);
+            if (!http.begin(plainClient, url)) return false;
+            static const char* cacheHeaders[] = {"Cache-Control", "Date", "Expires"};
+            if (lastFmApiRequest) http.collectHeaders(cacheHeaders, 3);
+
+            // HTTPClient can spend several seconds parsing a slow response or
+            // redirect chain. Let IDLE0 service the task watchdog first.
+            vTaskDelay(1);
+            const int status = http.GET();
+            vTaskDelay(1);
+            if (coverArt.networkPaused()) {
+                http.end();
+                return false;
+            }
+            if (status != HTTP_CODE_OK) {
+                retry = attempt < retries &&
+                        (status == 429 || status == HTTP_CODE_SERVICE_UNAVAILABLE);
+                if (retry) {
+                    log_w("##[COVER]# HTTP request failed host=%s status=%d, retrying once",
+                          requestHost(url).c_str(), status);
+                } else if (status == HTTP_CODE_NOT_FOUND) {
+                    log_d("##[COVER]# resource not found: %d", status);
+                } else {
+                    log_w("##[COVER]# HTTP request failed host=%s status=%d",
+                          requestHost(url).c_str(), status);
+                }
+                http.end();
+            } else {
+                const uint32_t freshnessSeconds = lastFmApiRequest
+                    ? responseFreshnessSeconds(http.header("Cache-Control"),
+                                               http.header("Date"), http.header("Expires"))
+                    : 0;
+                const int contentLength = http.getSize();
+                if (contentLength > 0 && static_cast<size_t>(contentLength) > limit) {
+                    log_w("##[COVER]# response too large: %d bytes (limit=%u)",
+                          contentLength, static_cast<unsigned>(limit));
+                    http.end();
+                    return false;
+                }
+
+                const size_t bufferCapacity = contentLength > 0
+                    ? static_cast<size_t>(contentLength)
+                    : limit;
+                PsramBufferStream sink(bufferCapacity);
+                if (!sink.valid()) {
+                    log_w("##[COVER]# PSRAM allocation failed (%u bytes)",
+                          static_cast<unsigned>(bufferCapacity));
+                    http.end();
+                    return false;
+                }
+                const int written = http.writeToStream(&sink);
+                http.end();
+                if (coverArt.networkPaused()) return false;
+                if (written < 0 || sink.size() == 0) {
+                    log_w("##[COVER]# response read failed: %d", written);
+                    return false;
+                }
+
+                size = sink.size();
+                data = sink.release();
+                if (data && lastFmApiRequest && freshnessSeconds > 0) {
+                    storeLastFmCachedResponse(url, data, size, freshnessSeconds);
+                }
+                return data != nullptr;
+            }
+        }
+        if (!retry) return false;
+        if (coverArt.networkPaused()) return false;
+        vTaskDelay(pdMS_TO_TICKS(1500));
+    }
+    return false;
+}
+
+bool httpGetRedirectLocation(const String& url, String& location) {
+    location = "";
+    if (coverArt.networkPaused()) return false;
+    if (!url.startsWith("http://")) return false;
+
+#ifdef USE_DLNA
+    DlnaHttpGuard dlnaHttpLock;
+#endif
+    if (coverArt.networkPaused()) return false;
+    CooperativeNetworkClient client;
+    HTTPClient http;
+    http.setConnectTimeout(COVER_CONNECT_TIMEOUT_MS);
+    http.setTimeout(COVER_READ_TIMEOUT_MS);
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    http.setUserAgent(HTTP_USER_AGENT);
+    if (!http.begin(client, url)) return false;
+
+    vTaskDelay(1);
+    const int status = http.GET();
+    vTaskDelay(1);
+    if (coverArt.networkPaused()) {
+        http.end();
+        return false;
+    }
+    const bool redirect = status == HTTP_CODE_MOVED_PERMANENTLY ||
+                          status == HTTP_CODE_FOUND || status == HTTP_CODE_SEE_OTHER ||
+                          status == HTTP_CODE_TEMPORARY_REDIRECT || status == 308;
+    if (redirect) location = http.getLocation();
+    http.end();
+
+    if (!redirect || !location.startsWith("http://")) {
+        if (status == HTTP_CODE_NOT_FOUND) {
+            log_d("##[COVER]# CAA has no cover: %d", status);
+        } else {
+            log_w("##[COVER]# CAA redirect failed host=%s status=%d",
+                  requestHost(url).c_str(), status);
+        }
+        location = "";
+        return false;
+    }
+    return true;
+}
+
+bool extractLastFmAlbumMbid(const uint8_t* jsonData, size_t jsonSize,
+                            char* mbid, size_t mbidSize) {
+    mbid[0] = '\0';
+    cJSON* root = cJSON_ParseWithLength(reinterpret_cast<const char*>(jsonData), jsonSize);
+    if (!root) return false;
+
+    cJSON* track = cJSON_GetObjectItemCaseSensitive(root, "track");
+    cJSON* album = cJSON_IsObject(track) ? cJSON_GetObjectItemCaseSensitive(track, "album") : nullptr;
+    cJSON* albumMbid = cJSON_IsObject(album) ? cJSON_GetObjectItemCaseSensitive(album, "mbid") : nullptr;
+    if (cJSON_IsString(albumMbid) && albumMbid->valuestring) {
+        strlcpy(mbid, albumMbid->valuestring, mbidSize);
+    }
+    cJSON_Delete(root);
+
+    if (strlen(mbid) != 36) {
+        mbid[0] = '\0';
+    } else {
+        for (size_t i = 0; i < 36; ++i) {
+            const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+            if ((separator && mbid[i] != '-') ||
+                (!separator && !isxdigit(static_cast<unsigned char>(mbid[i])))) {
+                mbid[0] = '\0';
+                break;
+            }
+        }
+    }
+    return mbid[0] != '\0';
+}
+
+bool nextArtistPart(const char*& cursor, char* output, size_t outputSize) {
+    if (!cursor || !output || outputSize == 0) return false;
+
+    while (*cursor == ';' || isspace(static_cast<unsigned char>(*cursor))) ++cursor;
+    if (*cursor == '\0') return false;
+
+    const char* end = strchr(cursor, ';');
+    const size_t rawLength = end ? static_cast<size_t>(end - cursor) : strlen(cursor);
+    const size_t copyLength = rawLength < outputSize - 1 ? rawLength : outputSize - 1;
+    memcpy(output, cursor, copyLength);
+    output[copyLength] = '\0';
+    cursor = end ? end + 1 : cursor + rawLength;
+
+    char* clean = trim(output);
+    if (clean != output) memmove(output, clean, strlen(clean) + 1);
+    return output[0] != '\0';
+}
+
+bool artistMatches(const char* expected, const char* candidate) {
+    if (!expected || !candidate) return false;
+
+    char normalizedExpected[128];
+    char normalizedCandidate[128];
+    normalizeKeyPart(expected, normalizedExpected, sizeof(normalizedExpected));
+    normalizeKeyPart(candidate, normalizedCandidate, sizeof(normalizedCandidate));
+    if (normalizedExpected[0] != '\0' &&
+        strcmp(normalizedExpected, normalizedCandidate) == 0) {
+        return true;
+    }
+
+    const char* expectedCursor = expected;
+    char expectedPart[128];
+    while (nextArtistPart(expectedCursor, expectedPart, sizeof(expectedPart))) {
+        char normalizedExpectedPart[128];
+        normalizeKeyPart(expectedPart, normalizedExpectedPart, sizeof(normalizedExpectedPart));
+        if (normalizedExpectedPart[0] == '\0') continue;
+
+        const char* candidateCursor = candidate;
+        char candidatePart[128];
+        while (nextArtistPart(candidateCursor, candidatePart, sizeof(candidatePart))) {
+            char normalizedCandidatePart[128];
+            normalizeKeyPart(candidatePart, normalizedCandidatePart,
+                             sizeof(normalizedCandidatePart));
+            if (strcmp(normalizedExpectedPart, normalizedCandidatePart) == 0) return true;
+        }
+    }
+    return false;
+}
+
+bool titleMatchesSafely(const char* expected, const char* candidate) {
+    if (!expected || !candidate || expected[0] == '\0' || candidate[0] == '\0') {
+        return false;
+    }
+    if (strcmp(expected, candidate) == 0) return true;
+
+    constexpr size_t MIN_PARTIAL_TITLE_LENGTH = 8;
+    return strlen(expected) >= MIN_PARTIAL_TITLE_LENGTH &&
+           strstr(candidate, expected) != nullptr;
+}
+
+bool extractLastFmTrackMatch(const uint8_t* jsonData, size_t jsonSize,
+                              const char* requiredArtist,
+                              const char* requiredTitle,
+                              char* artist, size_t artistSize,
+                              char* title, size_t titleSize) {
+    artist[0] = '\0';
+    title[0] = '\0';
+    cJSON* root = cJSON_ParseWithLength(reinterpret_cast<const char*>(jsonData), jsonSize);
+    if (!root) return false;
+
+    cJSON* results = cJSON_GetObjectItemCaseSensitive(root, "results");
+    cJSON* matches = cJSON_IsObject(results)
+                         ? cJSON_GetObjectItemCaseSensitive(results, "trackmatches")
+                         : nullptr;
+    cJSON* tracks = cJSON_IsObject(matches)
+                        ? cJSON_GetObjectItemCaseSensitive(matches, "track")
+                        : nullptr;
+    const bool hasRequiredArtist = requiredArtist && requiredArtist[0] != '\0';
+    char normalizedRequiredTitle[192];
+    normalizeTrackTitle(requiredTitle, normalizedRequiredTitle, sizeof(normalizedRequiredTitle));
+    char fallbackArtist[128] = {0};
+    char fallbackTitle[192] = {0};
+
+    const int trackCount = cJSON_IsArray(tracks) ? cJSON_GetArraySize(tracks) : 1;
+    for (int index = 0; index < trackCount; ++index) {
+        cJSON* track = cJSON_IsArray(tracks) ? cJSON_GetArrayItem(tracks, index) : tracks;
+        cJSON* matchArtist = cJSON_IsObject(track)
+                                 ? cJSON_GetObjectItemCaseSensitive(track, "artist")
+                                 : nullptr;
+        cJSON* matchTitle = cJSON_IsObject(track)
+                                ? cJSON_GetObjectItemCaseSensitive(track, "name")
+                                : nullptr;
+        if (!cJSON_IsString(matchArtist) || !matchArtist->valuestring ||
+            !cJSON_IsString(matchTitle) || !matchTitle->valuestring) {
+            continue;
+        }
+
+        char normalizedMatchTitle[192];
+        normalizeTrackTitle(matchTitle->valuestring, normalizedMatchTitle,
+                            sizeof(normalizedMatchTitle));
+        const bool titleMatches = titleMatchesSafely(normalizedRequiredTitle,
+                                                     normalizedMatchTitle);
+
+        if (hasRequiredArtist && titleMatches &&
+            artistMatches(requiredArtist, matchArtist->valuestring)) {
+            strlcpy(artist, matchArtist->valuestring, artistSize);
+            strlcpy(title, matchTitle->valuestring, titleSize);
+            break;
+        }
+
+        if (!hasRequiredArtist && fallbackArtist[0] == '\0' && titleMatches) {
+            strlcpy(fallbackArtist, matchArtist->valuestring, sizeof(fallbackArtist));
+            strlcpy(fallbackTitle, matchTitle->valuestring, sizeof(fallbackTitle));
+        }
+    }
+    if (artist[0] == '\0' && fallbackArtist[0] != '\0') {
+        strlcpy(artist, fallbackArtist, artistSize);
+        strlcpy(title, fallbackTitle, titleSize);
+        log_d("##[COVER]# title match fallback: '%s' / '%s' -> '%s' / '%s'",
+              requiredArtist ? requiredArtist : "", requiredTitle ? requiredTitle : "",
+              artist, title);
+    }
+    cJSON_Delete(root);
+    return artist[0] != '\0' && title[0] != '\0';
+}
+
+bool findLastFmTrackByTitle(const char* rawTitle, const char* requiredArtist,
+                             bool bluetoothTitleMode, char* artist, size_t artistSize,
+                             char* title, size_t titleSize) {
+    if (!lastFmConfigured()) return false;
+
+    char searchTitle[192];
+    if (bluetoothTitleMode) {
+        makeBluetoothTrackSearch(rawTitle, searchTitle, sizeof(searchTitle));
+    } else {
+        cleanTrackTitleForSearch(rawTitle, searchTitle, sizeof(searchTitle));
+    }
+    if (searchTitle[0] == '\0') return false;
+
+    String url = "http://ws.audioscrobbler.com/2.0/?method=track.search&format=json&limit=10&api_key=";
+    url += config.store.lastFmApiKey;
+    url += "&track=";
+    url += urlEncode(searchTitle);
+
+    uint8_t* jsonData = nullptr;
+    size_t jsonSize = 0;
+    if (!httpGetToPsram(url, API_RESPONSE_LIMIT, jsonData, jsonSize)) return false;
+    const bool found = extractLastFmTrackMatch(jsonData, jsonSize, requiredArtist, searchTitle,
+                                                artist, artistSize, title, titleSize);
+    free(jsonData);
+    if (found && bluetoothTitleMode) canonicalizeBluetoothTrackTitle(title);
+    if (found && title[0] != '\0') {
+        log_d("##[COVER]# title fallback: '%s' -> '%s' - '%s'",
+              searchTitle, artist, title);
+        return true;
+    }
+    return false;
+}
+
+bool isValidMbid(const char* mbid) {
+    if (!mbid || strlen(mbid) != 36) return false;
+    for (size_t i = 0; i < 36; ++i) {
+        const bool separator = i == 8 || i == 13 || i == 18 || i == 23;
+        if ((separator && mbid[i] != '-') ||
+            (!separator && !isxdigit(static_cast<unsigned char>(mbid[i])))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool extractReleaseGroupMbids(const uint8_t* jsonData, size_t jsonSize,
+                              MbidCandidates& candidates) {
+    cJSON* root = cJSON_ParseWithLength(reinterpret_cast<const char*>(jsonData), jsonSize);
+    if (!root) return false;
+
+    cJSON* recordings = cJSON_GetObjectItemCaseSensitive(root, "recordings");
+    cJSON* recording = nullptr;
+    cJSON_ArrayForEach(recording, recordings) {
+        cJSON* score = cJSON_GetObjectItemCaseSensitive(recording, "score");
+        if (!cJSON_IsNumber(score) || score->valueint < 90) continue;
+
+        cJSON* releases = cJSON_GetObjectItemCaseSensitive(recording, "releases");
+        cJSON* release = nullptr;
+        cJSON_ArrayForEach(release, releases) {
+            cJSON* releaseGroup = cJSON_GetObjectItemCaseSensitive(release, "release-group");
+            cJSON* id = cJSON_IsObject(releaseGroup)
+                            ? cJSON_GetObjectItemCaseSensitive(releaseGroup, "id")
+                            : nullptr;
+            if (cJSON_IsString(id) && isValidMbid(id->valuestring)) {
+                candidates.add(id->valuestring);
+                if (candidates.count >= MUSICBRAINZ_CANDIDATE_LIMIT) break;
+            }
+        }
+        if (candidates.count >= MUSICBRAINZ_CANDIDATE_LIMIT) break;
+    }
+    cJSON_Delete(root);
+    return candidates.count > 0;
+}
+
+bool findMusicBrainzReleaseGroup(const char* artist, const char* title,
+                                 MbidCandidates& candidates) {
+    if (coverArt.networkPaused()) return false;
+    char searchArtist[128];
+    char searchTitle[192];
+    makeMusicBrainzSearchPart(artist, searchArtist, sizeof(searchArtist), false);
+    makeMusicBrainzSearchPart(title, searchTitle, sizeof(searchTitle), true);
+    if (searchArtist[0] == '\0' || searchTitle[0] == '\0') return false;
+
+    const uint32_t now = millis();
+    const uint32_t elapsed = now - lastMusicBrainzRequestMs;
+    if (lastMusicBrainzRequestMs != 0 && elapsed < MUSICBRAINZ_INTERVAL_MS) {
+        uint32_t waitMs = MUSICBRAINZ_INTERVAL_MS - elapsed;
+        while (waitMs > 0 && !coverArt.networkPaused()) {
+            const uint32_t sliceMs = waitMs > 50 ? 50 : waitMs;
+            vTaskDelay(pdMS_TO_TICKS(sliceMs));
+            waitMs -= sliceMs;
+        }
+    }
+    if (coverArt.networkPaused()) return false;
+    lastMusicBrainzRequestMs = millis();
+
+    String query = "recording:\"";
+    query += searchTitle;
+    query += "\" AND artist:\"";
+    query += searchArtist;
+    query += "\"";
+
+    String url = "http://musicbrainz.org/ws/2/recording/?fmt=json&limit=5&query=";
+    url += urlEncode(query.c_str());
+
+    uint8_t* jsonData = nullptr;
+    size_t jsonSize = 0;
+    if (!httpGetToPsram(url, API_RESPONSE_LIMIT, jsonData, jsonSize)) return false;
+    const bool found = extractReleaseGroupMbids(jsonData, jsonSize, candidates);
+    free(jsonData);
+    if (found) {
+        log_d("##[COVER]# MusicBrainz release-group candidates: %u",
+              static_cast<unsigned>(candidates.count));
+    }
+    return found;
+}
+
+uint8_t jpegStartOfFrameMarker(const uint8_t* data, size_t size) {
+    if (!data || size < 4 || data[0] != 0xFF || data[1] != 0xD8) return 0;
+    size_t offset = 2;
+    while (offset + 3 < size) {
+        if (data[offset] != 0xFF) {
+            ++offset;
+            continue;
+        }
+        while (offset < size && data[offset] == 0xFF) ++offset;
+        if (offset >= size) break;
+        const uint8_t marker = data[offset++];
+        if (marker == 0xD9 || marker == 0xDA) break;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD8)) continue;
+        if (offset + 1 >= size) break;
+        const uint16_t segmentLength =
+            (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+        if (segmentLength < 2 || offset + segmentLength > size) break;
+        const bool startOfFrame = (marker >= 0xC0 && marker <= 0xC3) ||
+                                  (marker >= 0xC5 && marker <= 0xC7) ||
+                                  (marker >= 0xC9 && marker <= 0xCB) ||
+                                  (marker >= 0xCD && marker <= 0xCF);
+        if (startOfFrame) return marker;
+        offset += segmentLength;
+    }
+    return 0;
+}
+
+bool detectImage(const uint8_t* data, size_t size, bool& jpeg) {
+    if (size >= 8 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+        data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A) {
+        jpeg = false;
+        return true;
+    }
+    if (size >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) {
+        jpeg = true;
+        // LovyanGFX uses the small TJpgDec decoder, which accepts baseline
+        // sequential JPEG (SOF0) but not TuneIn's progressive SOF2 files.
+        return jpegStartOfFrameMarker(data, size) == 0xC0;
+    }
+    return false;
+}
+
+bool parseArchiveLocation(const String& location, String& item, String& filename) {
+    constexpr char marker[] = "/download/";
+    const int markerAt = location.indexOf(marker);
+    if (markerAt < 0) return false;
+
+    const int itemStart = markerAt + static_cast<int>(sizeof(marker) - 1);
+    const int itemEnd = location.indexOf('/', itemStart);
+    if (itemEnd <= itemStart) return false;
+
+    int filenameEnd = location.indexOf('?', itemEnd + 1);
+    if (filenameEnd < 0) filenameEnd = location.length();
+    if (filenameEnd <= itemEnd + 1) return false;
+
+    item = location.substring(itemStart, itemEnd);
+    filename = location.substring(itemEnd + 1, filenameEnd);
+    return item.startsWith("mbid-") && filename.length() > 0;
+}
+
+bool extractArchiveServers(const uint8_t* jsonData, size_t jsonSize,
+                           String& primaryUrl, String& secondaryUrl,
+                           const String& filename) {
+    cJSON* root = cJSON_ParseWithLength(reinterpret_cast<const char*>(jsonData), jsonSize);
+    if (!root) return false;
+
+    cJSON* d1 = cJSON_GetObjectItemCaseSensitive(root, "d1");
+    cJSON* d2 = cJSON_GetObjectItemCaseSensitive(root, "d2");
+    cJSON* directory = cJSON_GetObjectItemCaseSensitive(root, "dir");
+    const char* dir = cJSON_IsString(directory) ? directory->valuestring : nullptr;
+
+    if (dir && cJSON_IsString(d1) && d1->valuestring) {
+        primaryUrl = "http://";
+        primaryUrl += d1->valuestring;
+        primaryUrl += dir;
+        primaryUrl += '/';
+        primaryUrl += filename;
+    }
+    if (dir && cJSON_IsString(d2) && d2->valuestring) {
+        secondaryUrl = "http://";
+        secondaryUrl += d2->valuestring;
+        secondaryUrl += dir;
+        secondaryUrl += '/';
+        secondaryUrl += filename;
+    }
+    cJSON_Delete(root);
+    return primaryUrl.length() > 0;
+}
+
+bool resolveArchiveUrls(const char* mbid, bool releaseGroup,
+                        String& primaryUrl, String& secondaryUrl) {
+    if (coverArt.networkPaused()) return false;
+    String caaUrl = "http://coverartarchive.org/";
+    caaUrl += releaseGroup ? "release-group/" : "release/";
+    caaUrl += mbid;
+    caaUrl += "/front-250";
+
+    String location;
+    if (!httpGetRedirectLocation(caaUrl, location)) return false;
+    if (coverArt.networkPaused()) return false;
+
+    String item;
+    String filename;
+    if (!parseArchiveLocation(location, item, filename)) {
+        log_w("##[COVER]# invalid CAA archive location");
+        return false;
+    }
+
+    String metadataUrl = "http://archive.org/metadata/";
+    metadataUrl += item;
+    uint8_t* jsonData = nullptr;
+    size_t jsonSize = 0;
+    if (!httpGetToPsram(metadataUrl, API_RESPONSE_LIMIT, jsonData, jsonSize)) return false;
+    const bool found = extractArchiveServers(jsonData, jsonSize, primaryUrl, secondaryUrl,
+                                             filename);
+    free(jsonData);
+    return found;
+}
+
+bool fetchCoverArchive(const char* mbid, bool releaseGroup, uint8_t*& imageData,
+                       size_t& imageSize, bool& jpeg) {
+    if (coverArt.networkPaused()) return false;
+    String primaryUrl;
+    String secondaryUrl;
+    if (!resolveArchiveUrls(mbid, releaseGroup, primaryUrl, secondaryUrl)) return false;
+
+    if (!httpGetToPsram(primaryUrl, COVER_IMAGE_LIMIT, imageData, imageSize) &&
+        (secondaryUrl.length() == 0 ||
+         !httpGetToPsram(secondaryUrl, COVER_IMAGE_LIMIT, imageData, imageSize))) {
+        return false;
+    }
+    if (!detectImage(imageData, imageSize, jpeg)) {
+        free(imageData);
+        imageData = nullptr;
+        imageSize = 0;
+        return false;
+    }
+
+    // Keep only the received bytes instead of retaining the complete download limit.
+    uint8_t* compact = static_cast<uint8_t*>(ps_malloc(imageSize));
+    if (compact) {
+        memcpy(compact, imageData, imageSize);
+        free(imageData);
+        imageData = compact;
+    }
+    return true;
+}
+
+bool fetchExactCover(const char* artist, const char* title, uint8_t*& imageData,
+                     size_t& imageSize, bool& jpeg) {
+    if (coverArt.networkPaused() || !lastFmConfigured()) return false;
+    {
+        String apiUrl = "http://ws.audioscrobbler.com/2.0/?method=track.getInfo&autocorrect=1&format=json&api_key=";
+        apiUrl += config.store.lastFmApiKey;
+        apiUrl += "&artist=";
+        apiUrl += urlEncode(artist);
+        apiUrl += "&track=";
+        apiUrl += urlEncode(title);
+
+        uint8_t* jsonData = nullptr;
+        size_t jsonSize = 0;
+        char albumMbid[40]{};
+        bool haveLastFmMbid = false;
+        if (httpGetToPsram(apiUrl, API_RESPONSE_LIMIT, jsonData, jsonSize)) {
+            extractLastFmAlbumMbid(jsonData, jsonSize, albumMbid, sizeof(albumMbid));
+            haveLastFmMbid = albumMbid[0] != '\0';
+            free(jsonData);
+            jsonData = nullptr;
+
+            if (haveLastFmMbid &&
+                fetchCoverArchive(albumMbid, false, imageData, imageSize, jpeg)) {
+                recordCoverSource(CoverSource::CaaLastFmMbid);
+                return true;
+            }
+            if (coverArt.networkPaused()) return false;
+            if (!haveLastFmMbid) {
+                log_d("##[COVER]# Last.fm returned no album MBID, trying MusicBrainz");
+            } else {
+                log_d("##[COVER]# no release cover, trying MusicBrainz release-group");
+            }
+        } else {
+            log_d("##[COVER]# Last.fm unavailable, trying MusicBrainz");
+        }
+    }
+
+    MbidCandidates candidates;
+    if (coverArt.networkPaused() || !lastFmConfigured()) return false;
+    if (findMusicBrainzReleaseGroup(artist, title, candidates)) {
+        for (size_t i = 0; i < candidates.count; ++i) {
+            if (coverArt.networkPaused()) return false;
+            log_d("##[COVER]# trying release-group %u/%u: %s",
+                  static_cast<unsigned>(i + 1), static_cast<unsigned>(candidates.count),
+                  candidates.ids[i]);
+            if (fetchCoverArchive(candidates.ids[i], true, imageData, imageSize, jpeg)) {
+                recordCoverSource(CoverSource::CaaMusicBrainz);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool fetchTitleFallback(const char* artist, const char* title, bool bluetoothTitleMode,
+                        uint8_t*& imageData, size_t& imageSize, bool& jpeg) {
+    char matchedArtist[128];
+    char matchedTitle[192];
+    const char* requiredArtist = bluetoothTitleMode ? nullptr : artist;
+    if (!findLastFmTrackByTitle(title, requiredArtist, bluetoothTitleMode,
+                                matchedArtist, sizeof(matchedArtist),
+                                matchedTitle, sizeof(matchedTitle))) {
+        log_d("##[COVER]# title fallback found no safe track match");
+        return false;
+    }
+    if (coverArt.networkPaused()) return false;
+
+    char originalKey[322];
+    char matchedKey[322];
+    makeKey(artist, title, originalKey, sizeof(originalKey));
+    makeKey(matchedArtist, matchedTitle, matchedKey, sizeof(matchedKey));
+    if (strcmp(originalKey, matchedKey) == 0) return false;
+
+    return fetchExactCover(matchedArtist, matchedTitle, imageData, imageSize, jpeg);
+}
+
+bool fetchCover(const char* artist, const char* title, bool bluetoothTitleMode,
+                bool localFileMode, uint8_t*& imageData, size_t& imageSize, bool& jpeg) {
+    if (!lastFmConfigured()) return false;
+
+    // A title-only Bluetooth request intentionally has no trustworthy artist
+    // (YouTube's AVRCP artist is often merely the channel). Skip the exact
+    // artist/title endpoint and go straight to the guarded title fallback.
+    if ((!bluetoothTitleMode || (artist && artist[0] != '\0')) &&
+        fetchExactCover(artist, title, imageData, imageSize, jpeg)) {
+        return true;
+    }
+    if (coverArt.networkPaused()) return false;
+    if (fetchTitleFallback(artist, title, bluetoothTitleMode,
+                           imageData, imageSize, jpeg)) {
+        return true;
+    }
+    if (coverArt.networkPaused() || !localFileMode) return false;
+
+    // Local ID3 titles often contain a mix/remix qualifier that is absent
+    // from public music databases. Keep the displayed title intact and use
+    // the cleaned form only as a final cover-search fallback.
+    char cleanTitle[192];
+    strlcpy(cleanTitle, title ? title : "", sizeof(cleanTitle));
+    canonicalizeBluetoothTrackTitle(cleanTitle);
+    if (cleanTitle[0] == '\0' || strcmp(cleanTitle, title) == 0) return false;
+
+    log_i("##[SDCOVER]# retry with cleaned title: '%s' - '%s'",
+          artist, cleanTitle);
+    if (fetchExactCover(artist, cleanTitle, imageData, imageSize, jpeg)) return true;
+    if (coverArt.networkPaused()) return false;
+    return fetchTitleFallback(artist, cleanTitle, false,
+                              imageData, imageSize, jpeg);
+}
+
+} // namespace
+
+CoverArtManager coverArt;
+
+void CoverArtManager::begin() {
+    if (_queue || _task) return;
+    [[maybe_unused]] const size_t internalLargestBefore =
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!psramFound()) {
+        log_e("##[COVER]# PSRAM is required");
+        return;
+    }
+
+    cJSON_Hooks hooks{};
+    hooks.malloc_fn = cJsonPsramMalloc;
+    hooks.free_fn = cJsonPsramFree;
+    cJSON_InitHooks(&hooks);
+
+    constexpr UBaseType_t psramCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    _mutex = xSemaphoreCreateMutexWithCaps(psramCaps);
+    if (!_mutex) {
+        log_e("##[COVER]# mutex allocation failed");
+        return;
+    }
+    _queue = xQueueCreateWithCaps(1, sizeof(Request), psramCaps);
+    if (!_queue) {
+        log_e("##[COVER]# request queue allocation failed");
+        vSemaphoreDeleteWithCaps(_mutex);
+        _mutex = nullptr;
+        return;
+    }
+    constexpr BaseType_t targetCore = 0;
+    constexpr UBaseType_t taskPriority = 0;
+    if (xTaskCreatePinnedToCoreWithCaps(
+            _taskEntry, "cover_art", 8192, this, taskPriority, &_task, targetCore,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+        log_e("##[COVER]# task creation failed");
+        vQueueDeleteWithCaps(_queue);
+        _queue = nullptr;
+        vSemaphoreDeleteWithCaps(_mutex);
+        _mutex = nullptr;
+        _task = nullptr;
+        return;
+    }
+    log_i("##[COVER]# task ready (PSRAM stack/queue/JSON, HTTP transport, internal largest=%u->%u)",
+          static_cast<unsigned>(internalLargestBefore),
+          static_cast<unsigned>(
+              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+}
+
+void CoverArtManager::clear() {
+    if (!_mutex) return;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    _currentKey[0] = '\0';
+    _currentBluetoothTitleMode = false;
+    if (++_currentGeneration == 0) ++_currentGeneration;
+    if (_readyData) free(_readyData);
+    _readyData = nullptr;
+    _readySize = 0;
+    _readyGeneration = 0;
+    _readyKey[0] = '\0';
+    xSemaphoreGive(_mutex);
+}
+
+void CoverArtManager::requestCombined(const char* combinedTitle, bool bluetoothTitleMode,
+                                      bool localFileMode) {
+    if (!_queue || !combinedTitle) return;
+
+    Request request{};
+    bool haveTrackIdentity = splitCombinedTitle(
+        combinedTitle, request.artist, sizeof(request.artist),
+        request.title, sizeof(request.title));
+    if (!haveTrackIdentity) {
+        // YouTube/QCC can provide the useful video title without a genuine
+        // artist. In Bluetooth title mode that is still enough for the safe
+        // Last.fm title fallback; do not require a fabricated "Artist - "
+        // prefix merely to start a cover lookup.
+        if (bluetoothTitleMode && combinedTitle[0] != '\0') {
+            request.artist[0] = '\0';
+            strlcpy(request.title, combinedTitle, sizeof(request.title));
+            haveTrackIdentity = true;
+        }
+    }
+    request.bluetoothTitleMode = bluetoothTitleMode;
+    request.localFileMode = localFileMode;
+
+    if (lastFmConfigured() && haveTrackIdentity) {
+        if (!makeLookupKey(request.artist, request.title, request.bluetoothTitleMode,
+                           request.key, sizeof(request.key))) {
+            // Values such as "Not Provided" are temporary BT metadata, not a
+            // new track. Keep the current cover until useful metadata arrives.
+            return;
+        }
+    } else {
+        if (localFileMode && combinedTitle[0] != '\0' && !haveTrackIdentity) {
+            log_i("##[SDCOVER]# skipped, Artist - Title metadata unavailable: '%s'",
+                  combinedTitle);
+        }
+        clear();
+        return;
+    }
+
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    if (strcmp(_currentKey, request.key) == 0 &&
+        _currentBluetoothTitleMode == request.bluetoothTitleMode) {
+        xSemaphoreGive(_mutex);
+        return;
+    }
+    strlcpy(_currentKey, request.key, sizeof(_currentKey));
+    _currentBluetoothTitleMode = request.bluetoothTitleMode;
+    request.generation = ++_currentGeneration;
+    if (_currentGeneration == 0) request.generation = ++_currentGeneration;
+    if (_readyData) free(_readyData);
+    _readyData = nullptr;
+    _readySize = 0;
+    _readyGeneration = 0;
+    _readyKey[0] = '\0';
+    xSemaphoreGive(_mutex);
+
+    xQueueOverwrite(_queue, &request);
+    if (localFileMode) {
+        log_i("##[SDCOVER]# queued: '%s' - '%s'", request.artist, request.title);
+    }
+}
+
+bool CoverArtManager::pauseNetwork(uint32_t timeoutMs) {
+    if (!_mutex) return true;
+
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    _networkPaused = true;
+    bool active = _networkActive;
+    xSemaphoreGive(_mutex);
+
+    const uint32_t started = millis();
+    while (active && millis() - started < timeoutMs) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        xSemaphoreTake(_mutex, portMAX_DELAY);
+        active = _networkActive;
+        xSemaphoreGive(_mutex);
+    }
+    if (active) {
+        log_w("##[COVER]# network pause timed out after %lu ms",
+              static_cast<unsigned long>(millis() - started));
+        return false;
+    }
+    const uint32_t waited = millis() - started;
+    if (waited >= 10) {
+        log_d("##[COVER]# network paused for audio connect, waited=%lu ms",
+              static_cast<unsigned long>(waited));
+    }
+    return true;
+}
+
+void CoverArtManager::resumeNetwork() {
+    if (!_mutex) return;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    _networkPaused = false;
+    xSemaphoreGive(_mutex);
+}
+
+bool CoverArtManager::networkPaused() {
+    if (!_mutex) return false;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    const bool paused = _networkPaused;
+    xSemaphoreGive(_mutex);
+    return paused;
+}
+
+bool CoverArtManager::copyReady(uint8_t*& data, size_t& size, bool& jpeg,
+                                uint32_t& generation) {
+    data = nullptr;
+    size = 0;
+    generation = 0;
+    if (!_mutex) return false;
+
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    const bool matches = _readyData && _readySize > 0 &&
+                         _readyGeneration == _currentGeneration &&
+                         strcmp(_readyKey, _currentKey) == 0;
+    if (matches) {
+        data = static_cast<uint8_t*>(ps_malloc(_readySize));
+        if (data) {
+            memcpy(data, _readyData, _readySize);
+            size = _readySize;
+            jpeg = _readyJpeg;
+            generation = _readyGeneration;
+        }
+    }
+    xSemaphoreGive(_mutex);
+    return data != nullptr;
+}
+
+void CoverArtManager::_taskEntry(void* parameter) {
+    static_cast<CoverArtManager*>(parameter)->_taskLoop();
+}
+
+bool CoverArtManager::_isCurrent(const Request& request) {
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    const bool current = request.generation == _currentGeneration &&
+                         strcmp(request.key, _currentKey) == 0;
+    xSemaphoreGive(_mutex);
+    return current;
+}
+
+bool CoverArtManager::_beginNetworkRequest(const Request& request) {
+    for (;;) {
+        xSemaphoreTake(_mutex, portMAX_DELAY);
+        if (!_networkPaused) {
+            _networkActive = true;
+            xSemaphoreGive(_mutex);
+            return true;
+        }
+        xSemaphoreGive(_mutex);
+        if (!_isCurrent(request)) return false;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void CoverArtManager::_finishNetworkRequest() {
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    _networkActive = false;
+    xSemaphoreGive(_mutex);
+}
+
+void CoverArtManager::_publish(const Request& request, uint8_t* data, size_t size,
+                               bool jpeg) {
+    bool published = false;
+    xSemaphoreTake(_mutex, portMAX_DELAY);
+    if (request.generation == _currentGeneration && strcmp(request.key, _currentKey) == 0) {
+        if (_readyData) free(_readyData);
+        _readyData = data;
+        _readySize = size;
+        _readyJpeg = jpeg;
+        _readyGeneration = request.generation;
+        strlcpy(_readyKey, request.key, sizeof(_readyKey));
+        published = true;
+    }
+    xSemaphoreGive(_mutex);
+
+    if (published) {
+        log_i("##[COVER]# ready: '%s' - '%s' (%u bytes, internal largest=%u)",
+              request.artist, request.title, static_cast<unsigned>(size),
+              static_cast<unsigned>(heap_caps_get_largest_free_block(
+                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+        display.putRequest(NEWCOVER);
+    } else {
+        free(data);
+    }
+}
+
+void CoverArtManager::_taskLoop() {
+    Request request{};
+    for (;;) {
+        if (xQueueReceive(_queue, &request, portMAX_DELAY) != pdTRUE) continue;
+
+        vTaskDelay(pdMS_TO_TICKS(REQUEST_SETTLE_MS));
+        Request newer{};
+        while (xQueueReceive(_queue, &newer, 0) == pdTRUE) request = newer;
+        if (!_isCurrent(request)) continue;
+
+        if (WiFi.status() != WL_CONNECTED) {
+            log_w("##[COVER]# skipped, Wi-Fi is not connected");
+            continue;
+        }
+        if (!_beginNetworkRequest(request)) continue;
+
+        uint8_t* data = nullptr;
+        size_t size = 0;
+        bool jpeg = false;
+        if (request.localFileMode) {
+            log_i("##[SDCOVER]# lookup: '%s' - '%s'", request.artist, request.title);
+        }
+        const bool found = fetchCover(request.artist, request.title,
+                                      request.bluetoothTitleMode,
+                                      request.localFileMode, data, size, jpeg);
+        _finishNetworkRequest();
+        if (networkPaused()) {
+            if (data) free(data);
+            continue;
+        }
+        if (!found) {
+            if (request.localFileMode) {
+                log_i("##[SDCOVER]# no cover: '%s' - '%s'",
+                      request.artist, request.title);
+            } else {
+                log_d("##[COVER]# no cover: '%s' - '%s'",
+                      request.artist, request.title);
+            }
+            continue;
+        }
+        _publish(request, data, size, jpeg);
+    }
+}

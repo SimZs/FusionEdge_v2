@@ -1,0 +1,35 @@
+{
+  "title": "FusionEdge",
+  "config": {
+    "step": {
+      "confirm": {
+        "title": "{name} hozzáadása",
+        "description": "Hozzáadod ezt a FusionEdge rádiót az MQTT-kapcsolatán keresztül?"
+      }
+    },
+    "abort": {
+      "already_configured": "Ez a rádió már be van állítva",
+      "discovery_required": "Indítsd el a rádiót bekapcsolt MQTT-vel, és várd meg, amíg megjelenik a felismert eszközök között",
+      "invalid_discovery": "Érvénytelen FusionEdge MQTT-hirdetés"
+    }
+  },
+  "entity": {
+    "select": {
+      "bluetooth_output": {"name": "Bluetooth-kimenet"}
+    },
+    "switch": {
+      "clock_tts": {"name": "Óra bemondása"},
+      "clock_tts_no_stream": {"name": "Csak ha nincs lejátszás"},
+      "led_strip_screensaver": {"name": "LED képernyővédő alatt is"}
+    },
+    "text": {
+      "timer_weekday_start": {"name": "Hétköznapi bekapcsolás"},
+      "timer_weekday_stop": {"name": "Hétköznapi kikapcsolás"},
+      "timer_weekend_start": {"name": "Hétvégi bekapcsolás"},
+      "timer_weekend_stop": {"name": "Hétvégi kikapcsolás"}
+    },
+    "light": {
+      "led_strip": {"name": "LED-szalag"}
+    }
+  }
+}

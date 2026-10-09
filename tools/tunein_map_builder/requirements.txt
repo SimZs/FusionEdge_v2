@@ -1,0 +1,2 @@
+Pillow>=11,<13
+truststore>=0.10,<1
