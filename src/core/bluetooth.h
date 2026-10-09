@@ -296,6 +296,9 @@ class BluetoothPlayer {
     void handleInputConnectedDevice(const char* value, bool hasName);
     bool beginSourceScan(uint8_t seconds, uint8_t clientId);
     void finishSourceScan(const char* state, const char* message = nullptr);
+    void startSourceSwitchConnection(bool restorePrevious);
+    void queueSourceSwitchRollback(const char* reason);
+    void completeSourceSwitchConnection(const char* address);
     void publishSourceUiError(uint8_t clientId, const char* message) const;
     const btSourceScanDevice_t* findSourceScanDevice(const char* address) const;
     static bool validBluetoothAddress(const char* address);
@@ -310,6 +313,19 @@ class BluetoothPlayer {
         SOURCE_UI_COMMAND_SET_BT_ENABLE,
         SOURCE_UI_COMMAND_VERIFY_BT_ENABLE,
         SOURCE_UI_COMMAND_RECONNECT_LAST,
+        SOURCE_UI_COMMAND_SWITCH_DISCONNECT,
+        SOURCE_UI_COMMAND_SWITCH_QUERY_STATUS,
+    };
+
+    enum sourceSwitchState_e : uint8_t {
+        SOURCE_SWITCH_IDLE = 0,
+        SOURCE_SWITCH_DISCONNECTING,
+        SOURCE_SWITCH_WAIT_STANDBY,
+        SOURCE_SWITCH_CONNECTING_TARGET,
+        SOURCE_SWITCH_WAIT_ROLLBACK,
+        SOURCE_SWITCH_DISCONNECTING_TARGET,
+        SOURCE_SWITCH_WAIT_TARGET_STANDBY,
+        SOURCE_SWITCH_CONNECTING_PREVIOUS,
     };
 
     enum aliasSyncState_e : uint8_t {
@@ -432,6 +448,14 @@ class BluetoothPlayer {
     sourceUiCommand_e _sourceUiCommand = SOURCE_UI_COMMAND_NONE;
     uint8_t           _sourceUiCommandClientId = 0;
     uint32_t          _sourceUiCommandDeadlineMs = 0;
+    sourceSwitchState_e _sourceSwitchState = SOURCE_SWITCH_IDLE;
+    uint8_t           _sourceSwitchClientId = 0;
+    uint32_t          _sourceSwitchDeadlineMs = 0;
+    uint32_t          _sourceSwitchNextStatusQueryMs = 0;
+    char              _sourceSwitchTargetAddress[13] = {0};
+    char              _sourceSwitchPreviousAddress[13] = {0};
+    char              _sourceSwitchPreviousName[64] = {0};
+    bool              _sourceSwitchAddressReported = false;
     bool              _sourceConnectPending = false;
     bool              _sourceManualConnectPending = false;
     uint32_t          _sourceConnectDeadlineMs = 0;

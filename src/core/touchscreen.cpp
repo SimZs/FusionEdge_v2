@@ -106,10 +106,10 @@
 #    define SW_STATION_B   313
 
 // WeatherIconWidget: 64x64 px a player jobb also reszen.
-#    define SW_WEATHER_L  370
-#    define SW_WEATHER_R  (SW_WEATHER_L + 64)
-#    define SW_WEATHER_T  205
-#    define SW_WEATHER_B  269
+#    define SW_WEATHER_L  PLAYER_WEATHER_ICON_LEFT
+#    define SW_WEATHER_R  (SW_WEATHER_L + WeatherIconWidget::ICO_W)
+#    define SW_WEATHER_T  PLAYER_WEATHER_ICON_TOP
+#    define SW_WEATHER_B  (SW_WEATHER_T + WeatherIconWidget::ICO_H)
 
 void TouchScreen::init(uint16_t w, uint16_t h) {
     // A LovyanGFX a dsp.init() során már inicializálta a touch IC-t a buszon.

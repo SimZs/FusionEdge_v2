@@ -36,7 +36,14 @@ constexpr uint16_t PLAYER_SPECTRUM_WIDTH =
     PLAYER_SPECTRUM_BANDS * PLAYER_SPECTRUM_BAR_WIDTH +
     (PLAYER_SPECTRUM_BANDS - 1) * PLAYER_SPECTRUM_GAP;
 constexpr uint16_t PLAYER_WEATHER_LEFT = 65;   // right edge of the Bluetooth touch area
-constexpr uint16_t PLAYER_WEATHER_RIGHT = 370; // left edge of the weather icon
+constexpr uint16_t PLAYER_STATION_NUMBER_LEFT = 305;
+constexpr uint16_t PLAYER_STATION_NUMBER_WIDTH = 110;
+constexpr uint16_t PLAYER_WEATHER_RIGHT =
+    PLAYER_STATION_NUMBER_LEFT + PLAYER_STATION_NUMBER_WIDTH;
+constexpr uint16_t PLAYER_WEATHER_SCROLL_TOP = DSP_HEIGHT - 55;
+constexpr uint16_t PLAYER_WEATHER_ICON_LEFT = 370;
+constexpr uint16_t PLAYER_WEATHER_ICON_TOP =
+    PLAYER_WEATHER_SCROLL_TOP - WeatherIconWidget::ICO_H;
 constexpr uint16_t PLAYER_DATE_RIGHT = PLAYER_VOLUME_LEFT - 8;
 
 /* SROLLS  */                            /* {{ left, top, fontsize, align }, buffsize, uppercase, width, scrolldelay, scrolldelta, scrolltime } */
@@ -46,7 +53,7 @@ const ScrollConfig title2Conf     PROGMEM = {{ PLAYER_TRANSPORT_LEFT, 71, 24, WA
 const ScrollConfig playlistConf   PROGMEM = {{ TFT_FRAMEWDT, 146, 24, WA_LEFT }, 140, true, MAX_WIDTH, 1000, 7, 40 };
 const ScrollConfig apTitleConf    PROGMEM = {{ TFT_FRAMEWDT, TFT_FRAMEWDT, 4, WA_CENTER }, 140, false, MAX_WIDTH, 0, 7, 40 };
 const ScrollConfig apSettConf     PROGMEM = {{ TFT_FRAMEWDT, 320-TFT_FRAMEWDT-16, 2, WA_LEFT }, 140, false, MAX_WIDTH, 0, 5, 40 };
-const ScrollConfig weatherConf    PROGMEM = {{ PLAYER_WEATHER_LEFT, DSP_HEIGHT - 55, 18, WA_CENTER }, 254, false, PLAYER_WEATHER_RIGHT - PLAYER_WEATHER_LEFT, 0, 4, 40 };
+const ScrollConfig weatherConf    PROGMEM = {{ PLAYER_WEATHER_LEFT, PLAYER_WEATHER_SCROLL_TOP, 18, WA_CENTER }, 254, false, PLAYER_WEATHER_RIGHT - PLAYER_WEATHER_LEFT, 0, 4, 40 };
 
 /* BACKGROUNDS  */                       /* {{ left, top, fontsize, align }, width, height, outlined } */
 const FillConfig   metaBGConf     PROGMEM = {{ TFT_FRAMEWDT, 134, 0, WA_CENTER }, DSP_WIDTH - TFT_FRAMEWDT * 2, 1, true };

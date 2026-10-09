@@ -1,8 +1,15 @@
 # FusionEdge V2.0
 
-ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Az első kiadás verziója **v2.0.0**.
+ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.1**.
 
 Ez a FusionEdge továbbfejlesztett, PlatformIO/Arduino-alapú firmware-e.
+
+## Mi változott a 2.0.1-ben?
+
+- Bluetooth-kimenetnél a párosított hangszórók között közvetlenül lehet váltani. A rádió előbb bontja a meglévő kapcsolatot, majd az újhoz csatlakozik; sikertelen váltás után megpróbálja visszaállítani az előzőt.
+- Kijelző- és érintésigazítások az időjárás és a Bluetooth-eszközlista körül.
+- Javítottuk a DLNA-worker fordítási figyelmeztetését.
+- A [hardware mappába](hardware/README.md) bekerült az FSC-BT1058 adapter kapcsolási rajza, NYÁK-terve és gyártási csomagja.
 
 ## Mi új a 2.0.0-ban?
 
@@ -47,6 +54,10 @@ Az állomások egyedi logói nem részei ennek a kiadásnak. **Az első LittleFS
 ## Home Assistant
 
 Az opcionális [Home Assistant-integráció](HA/README.md) MQTT-n keresztül automatikusan felismerhető rádiót, média-lejátszó entitást és FusionEdge oldalsávos kezelőoldalt ad. A Bluetooth-eszközök keresése és párosítása továbbra is a rádió WebUI-jában történik.
+
+## Bluetooth-adapter
+
+Az FSC-BT1058 modulhoz tartozó adapter kapcsolási rajza, NYÁK-terve és gyártási fájljai a [hardware mappában](hardware/README.md) találhatók. Az ottani rövid útmutató a bekötés célját és a modul beszerzési linkjét is tartalmazza.
 
 ## Telepítési megjegyzések
 

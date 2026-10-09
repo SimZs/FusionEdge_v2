@@ -441,7 +441,8 @@ void Display::_buildPager() {
     const textBoxConfig footerModeConf = {
         65, 288, 110, 25, 16, WA_CENTER, 1, 4, false, 0, 0};
     const textBoxConfig footerStationConf = {
-        305, 288, 110, 25, 16, WA_CENTER, 1, 4, false, 0, 0};
+        PLAYER_STATION_NUMBER_LEFT, 288, PLAYER_STATION_NUMBER_WIDTH,
+        25, 16, WA_CENTER, 1, 4, false, 0, 0};
     _footerPlayMode = new textBoxWidget(
         footerModeConf, 8, false, config.theme.pmode,
         config.theme.background, config.theme.pmode);
@@ -504,7 +505,8 @@ void Display::_buildPager() {
     dateWidgetConf.width = PLAYER_DATE_RIGHT - _dc.left;
 #    endif
     // ── Icon widgetek ──────────────────────────────────────────────────────
-    WidgetConfig _wic = { 370, 205, 18, WA_RIGHT };
+    WidgetConfig _wic = {
+        PLAYER_WEATHER_ICON_LEFT, PLAYER_WEATHER_ICON_TOP, 18, WA_RIGHT };
     _weatherIcon = new WeatherIconWidget();
     _weatherIcon->init(_wic, config.theme.background);
     _weatherIcon->lock(!config.store.showweather);
@@ -1006,7 +1008,6 @@ void Display::_drawBluetoothInfo() {
         const bool sourceRole = role == BT_ROLE_SOURCE;
         const bool sourceReady = sourceRole && bluetooth.sourceUiReady();
         const bool controlsBusy = bluetooth.displayControlsBusy();
-        const bool anyConnected = bluetooth.connected();
 
         for (uint8_t row = 0; row < ROW_COUNT; ++row) {
             const uint8_t index = static_cast<uint8_t>(_btInfoFirst + row);
@@ -1072,8 +1073,7 @@ void Display::_drawBluetoothInfo() {
             const bool showConnect = sourceRole && !device.connected &&
                                      outputCapable;
             if (showDisconnect || showConnect) {
-                const bool enabled = sourceReady && !localOnly && !controlsBusy &&
-                                     (showDisconnect || !anyConnected);
+                const bool enabled = sourceReady && !localOnly && !controlsBusy;
                 const uint16_t buttonColor = enabled
                     ? (showDisconnect ? disconnectColor : accent)
                     : secondary;
@@ -1188,8 +1188,7 @@ bool Display::btInfoTap(uint16_t x, uint16_t y) {
     // A látható, de átmenetileg inaktív gomb nem zárja be a listát.
     if (!bluetooth.sourceUiReady() ||
         bluetooth.sourceOutputMode() == BT_SOURCE_OUTPUT_LOCAL_ONLY ||
-        bluetooth.displayControlsBusy() ||
-        (!device.connected && bluetooth.connected())) {
+        bluetooth.displayControlsBusy()) {
         return true;
     }
     if (device.connected) {

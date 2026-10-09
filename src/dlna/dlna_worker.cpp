@@ -334,8 +334,10 @@ void dlna_worker_start() {
   if (!g_littlefsMux) g_littlefsMux = xSemaphoreCreateMutex();
   if (!g_dlnaQueue) g_dlnaQueue = xQueueCreate(6, sizeof(DlnaJob));
 
+#if CORE_DEBUG_LEVEL >= 3
   const size_t internalLargestBefore =
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+#endif
   // This task opens LittleFS files. Flash reads disable the cache briefly, so
   // its active stack must remain in internal RAM. The previous 24 KB reserve
   // was unnecessarily large; 12 KB keeps TLS/WebUI headroom while the runtime
@@ -347,10 +349,12 @@ void dlna_worker_start() {
     s_workerTask = nullptr;
     Serial.println("[DLNA] worker task create FAILED");
   } else {
+#if CORE_DEBUG_LEVEL >= 3
     log_i("##[DLNA]# worker ready (stack=internal/12KB, internal largest=%u->%u)",
           static_cast<unsigned>(internalLargestBefore),
           static_cast<unsigned>(heap_caps_get_largest_free_block(
               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+#endif
     Serial.println("[DLNA] worker task started");
   }
 }

@@ -331,6 +331,14 @@ void BluetoothPlayer::begin() {
     _sourceUiCommand = SOURCE_UI_COMMAND_NONE;
     _sourceUiCommandClientId = 0;
     _sourceUiCommandDeadlineMs = 0;
+    _sourceSwitchState = SOURCE_SWITCH_IDLE;
+    _sourceSwitchClientId = 0;
+    _sourceSwitchDeadlineMs = 0;
+    _sourceSwitchNextStatusQueryMs = 0;
+    _sourceSwitchTargetAddress[0] = '\0';
+    _sourceSwitchPreviousAddress[0] = '\0';
+    _sourceSwitchPreviousName[0] = '\0';
+    _sourceSwitchAddressReported = false;
     _sourceConnectPending = false;
     _sourceManualConnectPending = false;
     _sourceConnectDeadlineMs = 0;
@@ -672,6 +680,8 @@ bool BluetoothPlayer::requestRole(btModuleRole_e role,
     _sourceUiCommand = SOURCE_UI_COMMAND_NONE;
     _sourceConnectPending = false;
     _sourceManualConnectPending = false;
+    _sourceSwitchState = SOURCE_SWITCH_IDLE;
+    _sourceSwitchDeadlineMs = 0;
     _sourceScanRequestedSeconds = BT_SOURCE_SCAN_SECONDS;
     if (_sinkControlQueue) xQueueReset(_sinkControlQueue);
     __atomic_store_n(&_sinkVolumePending, false, __ATOMIC_RELEASE);
@@ -1157,6 +1167,7 @@ void BluetoothPlayer::serviceSourceAudioEnable() {
         !_startupProbeComplete || _consoleCommandPending ||
         aliasSyncBusy() || inputUiBusy() || _sourceScanActive ||
         _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE ||
         roleTransitionBusy() || _moduleRole != BT_ROLE_SOURCE) {
         return;
     }
@@ -1484,6 +1495,7 @@ void BluetoothPlayer::serviceAliasSync() {
     if (_consoleCommandPending || _sourceAudioEnablePending || inputUiBusy() ||
         sinkControlBusy() ||
         _sourceScanActive || _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE ||
         (roleTransitionBusy() && !roleReadyForAlias)) {
         return;
     }
@@ -1582,6 +1594,7 @@ bool BluetoothPlayer::displayControlsBusy() const {
            inputUiBusy() || sinkControlBusy() || _consoleCommandPending ||
            _sourceAudioEnablePending || _sourceScanActive ||
            _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+           _sourceSwitchState != SOURCE_SWITCH_IDLE ||
            sourceOutputRoutePending();
 }
 
@@ -1636,7 +1649,8 @@ bool BluetoothPlayer::setInputDiscoverable(bool enabled, uint8_t clientId) {
     }
     if (inputUiBusy() || aliasSyncBusy() || sinkControlBusy() || roleTransitionBusy() ||
         _consoleCommandPending || _sourceAudioEnablePending ||
-        _sourceUiCommand != SOURCE_UI_COMMAND_NONE) {
+        _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE) {
         publishInputUiSnapshot(clientId,
                                "Bluetooth module is busy; try again shortly.");
         return false;
@@ -1672,7 +1686,8 @@ bool BluetoothPlayer::forgetInputPairedDevice(const char* address,
     }
     if (inputUiBusy() || aliasSyncBusy() || sinkControlBusy() || roleTransitionBusy() ||
         _consoleCommandPending || _sourceAudioEnablePending ||
-        _sourceUiCommand != SOURCE_UI_COMMAND_NONE) {
+        _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE) {
         netserver.btInputPairedStateToWs(clientId, "error",
                                          _inputPairedDeviceCount,
                                          "Bluetooth module is busy.");
@@ -1792,7 +1807,8 @@ void BluetoothPlayer::serviceInputUiControl() {
         !_startupProbeComplete || aliasSyncBusy() || sinkControlBusy() ||
         roleTransitionBusy() || _consoleCommandPending ||
         _sourceAudioEnablePending || _sourceScanActive ||
-        _sourceUiCommand != SOURCE_UI_COMMAND_NONE) {
+        _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE) {
         return;
     }
     if (static_cast<uint32_t>(now - _lastAtTxMs) < BT_AT_COMMAND_GUARD_MS) {
@@ -2070,6 +2086,8 @@ bool BluetoothPlayer::setSourceOutputMode(uint8_t mode, uint8_t clientId) {
     } else {
         _sourceReconnectAfterEnable = false;
         _sourceReconnectNextActionMs = 0;
+        _sourceSwitchState = SOURCE_SWITCH_IDLE;
+        _sourceSwitchDeadlineMs = 0;
     }
     log_i("##[BT-TX]# source output route requested: %s",
           mode == BT_SOURCE_OUTPUT_BLUETOOTH_ONLY
@@ -2095,6 +2113,7 @@ bool BluetoothPlayer::sourceUiReady() const {
     return _moduleRole == BT_ROLE_SOURCE && _startupProbeComplete &&
            !roleTransitionBusy() && !aliasSyncBusy() &&
            !sourceOutputRoutePending() &&
+           _sourceSwitchState == SOURCE_SWITCH_IDLE &&
            !_sourceUiInitializationPending;
 }
 
@@ -2194,7 +2213,8 @@ bool BluetoothPlayer::startSourceScan(uint8_t seconds, uint8_t clientId) {
     }
     if (roleTransitionBusy() || _consoleCommandPending ||
         _sourceAudioEnablePending || aliasSyncBusy() || inputUiBusy() ||
-        _sourceUiCommand != SOURCE_UI_COMMAND_NONE) {
+        _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE) {
         publishSourceUiError(clientId,
                              "Bluetooth module is busy; try again shortly");
         return false;
@@ -2236,6 +2256,11 @@ bool BluetoothPlayer::startSourceScan(uint8_t seconds, uint8_t clientId) {
 }
 
 bool BluetoothPlayer::stopSourceScan(uint8_t clientId) {
+    if (_sourceSwitchState != SOURCE_SWITCH_IDLE) {
+        publishSourceUiError(clientId,
+                             "Speaker switch is in progress");
+        return false;
+    }
     if (!_sourceScanActive) {
         publishSourceUiSnapshot(clientId);
         return true;
@@ -2278,14 +2303,52 @@ bool BluetoothPlayer::connectSourceDevice(const char* address,
     }
     if (roleTransitionBusy() || _consoleCommandPending ||
         _sourceAudioEnablePending || aliasSyncBusy() || inputUiBusy() || _sourceScanActive ||
-        _sourceUiCommand != SOURCE_UI_COMMAND_NONE) {
+        _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE) {
         publishSourceUiError(clientId,
                              "Wait for scanning or role switching to finish");
         return false;
     }
-    if (_lastA2dpStatus >= 2 && _lastA2dpStatus <= 5) {
+    if (_lastA2dpStatus >= 3 && _lastA2dpStatus <= 5 &&
+        _sourceConnectedAddress[0] &&
+        strcasecmp(_sourceConnectedAddress, address) == 0) {
+        publishSourceUiSnapshot(clientId);
+        return true;
+    }
+    if (_lastA2dpStatus >= 3 && _lastA2dpStatus <= 5) {
+        if (!_sourceConnectedAddress[0]) {
+            publishSourceUiError(clientId,
+                                 "Wait for the current speaker to be identified before switching");
+            return false;
+        }
+        strlcpy(_sourceSwitchTargetAddress, address,
+                sizeof(_sourceSwitchTargetAddress));
+        strlcpy(_sourceSwitchPreviousAddress, _sourceConnectedAddress,
+                sizeof(_sourceSwitchPreviousAddress));
+        strlcpy(_sourceSwitchPreviousName, _sourceConnectedName,
+                sizeof(_sourceSwitchPreviousName));
+        _sourceSwitchClientId = clientId;
+        _sourceSwitchState = SOURCE_SWITCH_DISCONNECTING;
+        _sourceSwitchDeadlineMs = millis() + 7000U;
+        _sourceUiCommand = SOURCE_UI_COMMAND_SWITCH_DISCONNECT;
+        _sourceUiCommandClientId = clientId;
+        _sourceUiCommandDeadlineMs = millis() + 3000U;
+        sendAT("AT+A2DPDISC");
+        netserver.btSourceScanStateToWs(
+            clientId, "switching", _sourceScanDeviceCount,
+            "Disconnecting the current speaker before switching...");
+        netserver.btSourceStateToWs(
+            0, moduleRoleName(_moduleRole),
+            static_cast<uint8_t>(_lastA2dpStatus), false,
+            _sourceConnectPending, _sourceConnectedAddress,
+            _sourceConnectedName);
+        log_i("##[BT-TX]# switching speaker %s -> %s: disconnect requested",
+              _sourceSwitchPreviousAddress, _sourceSwitchTargetAddress);
+        return true;
+    }
+    if (_lastA2dpStatus == 2 || _sourceConnectPending) {
         publishSourceUiError(clientId,
-                             "Disconnect the current speaker first");
+                             "Wait for the current connection attempt to finish");
         return false;
     }
 
@@ -2321,7 +2384,8 @@ bool BluetoothPlayer::disconnectSourceDevice(uint8_t clientId) {
     }
     if (roleTransitionBusy() || _consoleCommandPending ||
         _sourceAudioEnablePending || aliasSyncBusy() || inputUiBusy() || _sourceScanActive ||
-        _sourceUiCommand != SOURCE_UI_COMMAND_NONE) {
+        _sourceUiCommand != SOURCE_UI_COMMAND_NONE ||
+        _sourceSwitchState != SOURCE_SWITCH_IDLE) {
         publishSourceUiError(clientId, "Bluetooth module is busy");
         return false;
     }
@@ -2358,6 +2422,99 @@ void BluetoothPlayer::finishSourceScan(const char* state,
         static_cast<uint8_t>(_lastA2dpStatus), false,
         _sourceConnectPending, _sourceConnectedAddress,
         _sourceConnectedName);
+}
+
+void BluetoothPlayer::startSourceSwitchConnection(bool restorePrevious) {
+    const char* address = restorePrevious ? _sourceSwitchPreviousAddress
+                                          : _sourceSwitchTargetAddress;
+    const uint32_t now = millis();
+    _sourceSwitchState = restorePrevious ? SOURCE_SWITCH_CONNECTING_PREVIOUS
+                                         : SOURCE_SWITCH_CONNECTING_TARGET;
+    _sourceSwitchAddressReported = false;
+    _sourceSwitchDeadlineMs = now + BT_SOURCE_CONNECT_TIMEOUT_MS;
+    _sourceConnectPending = true;
+    _sourceManualConnectPending = true;
+    _sourceConnectDeadlineMs = _sourceSwitchDeadlineMs;
+    strlcpy(_sourceConnectedAddress, address,
+            sizeof(_sourceConnectedAddress));
+    if (restorePrevious) {
+        strlcpy(_sourceConnectedName, _sourceSwitchPreviousName,
+                sizeof(_sourceConnectedName));
+    } else {
+        const btSourceScanDevice_t* device = findSourceScanDevice(address);
+        strlcpy(_sourceConnectedName, device ? device->name : "",
+                sizeof(_sourceConnectedName));
+    }
+    _sourceUiCommand = SOURCE_UI_COMMAND_CONNECT;
+    _sourceUiCommandClientId = _sourceSwitchClientId;
+    _sourceUiCommandDeadlineMs = now + 3000U;
+
+    char command[32];
+    snprintf(command, sizeof(command), "AT+A2DPCONN=%s", address);
+    sendAT(command);
+    netserver.btSourceScanStateToWs(
+        _sourceSwitchClientId, restorePrevious ? "restoring" : "connecting",
+        _sourceScanDeviceCount,
+        restorePrevious ? "New speaker unavailable; reconnecting the previous speaker..."
+                        : "Connecting to the selected speaker...");
+    log_i("##[BT-TX]# speaker switch %s: %s",
+          restorePrevious ? "rollback" : "target connect", address);
+}
+
+void BluetoothPlayer::queueSourceSwitchRollback(const char* reason) {
+    if (_sourceSwitchState != SOURCE_SWITCH_CONNECTING_TARGET) return;
+    _sourceSwitchState = SOURCE_SWITCH_WAIT_ROLLBACK;
+    _sourceSwitchDeadlineMs = millis() + 7000U;
+    _sourceSwitchNextStatusQueryMs = millis() + 500U;
+    _sourceConnectPending = false;
+    _sourceManualConnectPending = false;
+    _sourceConnectDeadlineMs = 0;
+    netserver.btSourceScanStateToWs(
+        _sourceSwitchClientId, "restoring", _sourceScanDeviceCount,
+        "New speaker did not connect; restoring the previous speaker...");
+    log_w("##[BT-TX]# speaker switch failed (%s); restoring %s",
+          reason ? reason : "unknown", _sourceSwitchPreviousAddress);
+}
+
+void BluetoothPlayer::completeSourceSwitchConnection(const char* address) {
+    if (!_sourceSwitchAddressReported || _lastA2dpStatus < 3 ||
+        _lastA2dpStatus > 5 || !address) return;
+
+    const bool lateConnection =
+        _sourceSwitchState == SOURCE_SWITCH_WAIT_ROLLBACK;
+    const bool target = _sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET ||
+        (lateConnection &&
+         strcasecmp(address, _sourceSwitchTargetAddress) == 0);
+    const bool previous =
+        _sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS ||
+        (lateConnection &&
+         strcasecmp(address, _sourceSwitchPreviousAddress) == 0);
+    if (!target && !previous && !lateConnection) return;
+    const char* expected = target ? _sourceSwitchTargetAddress
+                                  : _sourceSwitchPreviousAddress;
+    const bool matched = strcasecmp(address, expected) == 0;
+    _sourceSwitchState = SOURCE_SWITCH_IDLE;
+    _sourceSwitchDeadlineMs = 0;
+    _sourceConnectPending = false;
+    _sourceManualConnectPending = false;
+    _sourceConnectDeadlineMs = 0;
+    if (target && matched) {
+        netserver.btSourceScanStateToWs(
+            _sourceSwitchClientId, "connected", _sourceScanDeviceCount,
+            "Switched to the selected speaker.");
+        log_i("##[BT-TX]# speaker switch complete: %s", address);
+    } else if (previous && matched) {
+        publishSourceUiError(
+            _sourceSwitchClientId,
+            "New speaker did not connect; previous speaker restored");
+        log_w("##[BT-TX]# speaker switch rolled back to %s", address);
+    } else {
+        publishSourceUiError(
+            _sourceSwitchClientId,
+            "A different speaker connected during the switch; check the active device");
+        log_w("##[BT-TX]# unexpected speaker during switch: %s (expected %s)",
+              address, expected);
+    }
 }
 
 void BluetoothPlayer::retryOrFailSourceOutputRoute(const char* reason) {
@@ -2400,6 +2557,16 @@ void BluetoothPlayer::serviceSourceDeviceControl() {
             _sourceScanDeadlineMs = 0;
         }
         if (timedOut == SOURCE_UI_COMMAND_CONNECT) {
+            if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET) {
+                // A lost command reply is not proof that the A2DP link failed.
+                // Let the connection-state deadline decide before rollback.
+                log_w("##[BT-TX]# target connect reply timed out; waiting for A2DP state");
+                return;
+            }
+            if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS) {
+                log_w("##[BT-TX]# previous-speaker connect reply timed out; waiting for A2DP state");
+                return;
+            }
             _sourceConnectPending = false;
             _sourceManualConnectPending = false;
             _sourceConnectDeadlineMs = 0;
@@ -2410,6 +2577,29 @@ void BluetoothPlayer::serviceSourceDeviceControl() {
             _sourceConnectPending = false;
             _sourceManualConnectPending = false;
             _sourceReconnectAfterEnable = false;
+        }
+        if (timedOut == SOURCE_UI_COMMAND_SWITCH_DISCONNECT) {
+            if (_lastA2dpStatus == 1) {
+                _sourceSwitchState =
+                    _sourceSwitchState == SOURCE_SWITCH_DISCONNECTING_TARGET
+                        ? SOURCE_SWITCH_WAIT_ROLLBACK
+                        : SOURCE_SWITCH_WAIT_STANDBY;
+                _sourceSwitchDeadlineMs = now + 7000U;
+                return;
+            }
+            // DISC may have been accepted even if its terminal reply was
+            // lost. Query the actual A2DP state before giving up.
+            _sourceSwitchState =
+                _sourceSwitchState == SOURCE_SWITCH_DISCONNECTING_TARGET
+                    ? SOURCE_SWITCH_WAIT_TARGET_STANDBY
+                    : SOURCE_SWITCH_WAIT_STANDBY;
+            _sourceSwitchDeadlineMs = now + 7000U;
+            _sourceSwitchNextStatusQueryMs = now + 500U;
+            return;
+        }
+        if (timedOut == SOURCE_UI_COMMAND_SWITCH_QUERY_STATUS) {
+            // The next bounded poll or overall switch deadline will decide.
+            return;
         }
         publishSourceUiError(clientId, "Bluetooth command response timeout");
     }
@@ -2423,6 +2613,23 @@ void BluetoothPlayer::serviceSourceDeviceControl() {
 
     if (_sourceConnectPending &&
         static_cast<int32_t>(now - _sourceConnectDeadlineMs) >= 0) {
+        if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET) {
+            queueSourceSwitchRollback("target connection timeout");
+            return;
+        }
+        if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS) {
+            _sourceSwitchState = SOURCE_SWITCH_IDLE;
+            _sourceSwitchDeadlineMs = 0;
+            _sourceConnectPending = false;
+            _sourceManualConnectPending = false;
+            _sourceConnectDeadlineMs = 0;
+            _sourceConnectedAddress[0] = '\0';
+            _sourceConnectedName[0] = '\0';
+            publishSourceUiError(
+                _sourceSwitchClientId,
+                "New speaker failed; previous speaker could not be restored automatically");
+            return;
+        }
         const bool manualConnect = _sourceManualConnectPending;
         _sourceConnectPending = false;
         _sourceManualConnectPending = false;
@@ -2436,9 +2643,104 @@ void BluetoothPlayer::serviceSourceDeviceControl() {
                 : "Speaker connection timed out");
     }
 
+    if (_sourceSwitchState == SOURCE_SWITCH_WAIT_STANDBY &&
+        _sourceUiCommand == SOURCE_UI_COMMAND_NONE) {
+        if (_lastA2dpStatus == 1 &&
+            !_consoleCommandPending && !_sourceAudioEnablePending &&
+            !aliasSyncBusy() && !inputUiBusy() && !roleTransitionBusy() &&
+            !_sourceScanActive && !_sourceRouteApplyPending &&
+            _moduleBluetoothEnabled == 1 &&
+            static_cast<uint32_t>(now - _lastAtTxMs) >= BT_AT_COMMAND_GUARD_MS) {
+            startSourceSwitchConnection(false);
+            return;
+        }
+        if (static_cast<int32_t>(now - _sourceSwitchDeadlineMs) >= 0) {
+            const uint8_t clientId = _sourceSwitchClientId;
+            _sourceSwitchState = SOURCE_SWITCH_IDLE;
+            _sourceSwitchDeadlineMs = 0;
+            publishSourceUiError(
+                clientId,
+                "Previous speaker did not disconnect; select Connect again");
+        }
+    }
+
+    if (_sourceSwitchState == SOURCE_SWITCH_WAIT_ROLLBACK &&
+        _sourceUiCommand == SOURCE_UI_COMMAND_NONE) {
+        if (_lastA2dpStatus == 1 &&
+            !_consoleCommandPending && !_sourceAudioEnablePending &&
+            !aliasSyncBusy() && !inputUiBusy() && !roleTransitionBusy() &&
+            !_sourceRouteApplyPending && _moduleBluetoothEnabled == 1 &&
+            static_cast<uint32_t>(now - _lastAtTxMs) >= BT_AT_COMMAND_GUARD_MS) {
+            startSourceSwitchConnection(true);
+            return;
+        }
+        if (_lastA2dpStatus >= 2 && _lastA2dpStatus <= 5 &&
+            static_cast<int32_t>(now - _sourceSwitchNextStatusQueryMs) >= 0 &&
+            static_cast<uint32_t>(now - _lastAtTxMs) >= BT_AT_COMMAND_GUARD_MS) {
+            _sourceSwitchState = SOURCE_SWITCH_DISCONNECTING_TARGET;
+            _sourceSwitchDeadlineMs = now + 7000U;
+            _sourceUiCommand = SOURCE_UI_COMMAND_SWITCH_DISCONNECT;
+            _sourceUiCommandClientId = _sourceSwitchClientId;
+            _sourceUiCommandDeadlineMs = now + 3000U;
+            sendAT("AT+A2DPDISC");
+            log_w("##[BT-TX]# cancelling unfinished target connection before rollback");
+            return;
+        }
+        if (static_cast<int32_t>(now - _sourceSwitchDeadlineMs) >= 0) {
+            _sourceSwitchState = SOURCE_SWITCH_IDLE;
+            publishSourceUiError(
+                _sourceSwitchClientId,
+                "Could not stop the new connection attempt; reconnect the previous speaker manually");
+        }
+    }
+
+    if (_sourceSwitchState == SOURCE_SWITCH_DISCONNECTING_TARGET &&
+        _sourceUiCommand == SOURCE_UI_COMMAND_NONE) {
+        if (_lastA2dpStatus == 1) {
+            _sourceSwitchState = SOURCE_SWITCH_WAIT_ROLLBACK;
+            _sourceSwitchDeadlineMs = now + 7000U;
+        } else if (static_cast<int32_t>(now - _sourceSwitchDeadlineMs) >= 0) {
+            _sourceSwitchState = SOURCE_SWITCH_IDLE;
+            publishSourceUiError(
+                _sourceSwitchClientId,
+                "New connection did not disconnect; reconnect the previous speaker manually");
+        }
+    }
+
+    if ((_sourceSwitchState == SOURCE_SWITCH_WAIT_STANDBY ||
+         _sourceSwitchState == SOURCE_SWITCH_WAIT_TARGET_STANDBY) &&
+        _sourceUiCommand == SOURCE_UI_COMMAND_NONE) {
+        if (_sourceSwitchState == SOURCE_SWITCH_WAIT_TARGET_STANDBY &&
+            _lastA2dpStatus == 1) {
+            _sourceSwitchState = SOURCE_SWITCH_WAIT_ROLLBACK;
+            _sourceSwitchDeadlineMs = now + 7000U;
+        } else if (_lastA2dpStatus != 1 &&
+                   static_cast<int32_t>(now - _sourceSwitchDeadlineMs) >= 0) {
+            const bool restoring =
+                _sourceSwitchState == SOURCE_SWITCH_WAIT_TARGET_STANDBY;
+            _sourceSwitchState = SOURCE_SWITCH_IDLE;
+            publishSourceUiError(
+                _sourceSwitchClientId,
+                restoring
+                    ? "New connection did not disconnect; reconnect the previous speaker manually"
+                    : "Previous speaker did not disconnect; select Connect again");
+        } else if (_lastA2dpStatus != 1 &&
+                   static_cast<int32_t>(now - _sourceSwitchNextStatusQueryMs) >= 0 &&
+                   !_consoleCommandPending &&
+                   static_cast<uint32_t>(now - _lastAtTxMs) >= BT_AT_COMMAND_GUARD_MS) {
+            _sourceUiCommand = SOURCE_UI_COMMAND_SWITCH_QUERY_STATUS;
+            _sourceUiCommandClientId = _sourceSwitchClientId;
+            _sourceUiCommandDeadlineMs = now + 1500U;
+            _sourceSwitchNextStatusQueryMs = now + 2000U;
+            sendAT("AT+A2DPSTAT");
+        }
+    }
+
     const uint8_t outputMode = sourceOutputMode();
     if (_moduleRole == BT_ROLE_SOURCE &&
         outputMode == BT_SOURCE_OUTPUT_LOCAL_ONLY) {
+        _sourceSwitchState = SOURCE_SWITCH_IDLE;
+        _sourceSwitchDeadlineMs = 0;
         _sourceReconnectAfterEnable = false;
         _sourceReconnectNextActionMs = 0;
         _sourceConnectPending = false;
@@ -2458,6 +2760,7 @@ void BluetoothPlayer::serviceSourceDeviceControl() {
     // parameterless A2DPCONN command reconnects the last A2DP endpoint while
     // keeping the paired list and AUTOCONN setting untouched.
     if (_sourceReconnectAfterEnable && !_sourceRouteApplyPending &&
+        _sourceSwitchState == SOURCE_SWITCH_IDLE &&
         _moduleRole == BT_ROLE_SOURCE &&
         outputMode != BT_SOURCE_OUTPUT_LOCAL_ONLY &&
         _moduleBluetoothEnabled == 1) {
@@ -2568,6 +2871,7 @@ void BluetoothPlayer::loop() {
         !aliasSyncBusy() && !inputUiBusy() && !sinkControlBusy() &&
         !_sourceAudioEnablePending &&
         !_sourceScanActive && _sourceUiCommand == SOURCE_UI_COMMAND_NONE &&
+        _sourceSwitchState == SOURCE_SWITCH_IDLE &&
         !roleTransitionBusy() && now - lastPing > 10000) {
         lastPing = now;
         sendAT("AT+STAT");
@@ -2975,7 +3279,6 @@ void BluetoothPlayer::handleSourceScanResult(const char* value) {
     if (addressType != 2 || !validBluetoothAddress(fields[2])) {
         return; // WebUI source pairing currently lists BR/EDR endpoints only.
     }
-
     const long parsedRssi = strtol(fields[3], nullptr, 10);
     const size_t reportedNameLength = strtoul(fields[4], nullptr, 10);
     const size_t availableNameLength = strlen(cursor);
@@ -3087,6 +3390,15 @@ void BluetoothPlayer::handleSourceConnectedDevice(const char* value,
     if (addressChanged && _inputUiCommand != INPUT_UI_REFRESH_RSSI) {
         _inputRefreshPending = true;
     }
+    // Only +A2DPDEV confirms the connected endpoint. +A2DPCONN merely
+    // announces an attempt and must not complete the switch prematurely.
+    if (hasName &&
+        (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET ||
+         _sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS ||
+         _sourceSwitchState == SOURCE_SWITCH_WAIT_ROLLBACK)) {
+        _sourceSwitchAddressReported = true;
+        completeSourceSwitchConnection(address);
+    }
 
     netserver.btSourceStateToWs(
         0, moduleRoleName(_moduleRole),
@@ -3133,6 +3445,9 @@ void BluetoothPlayer::handleA2dpStatus(uint32_t status) {
         _moduleRole == BT_ROLE_SOURCE && status == 1U &&
         previousStatus == 2U && _sourceConnectPending &&
         _sourceManualConnectPending;
+    const bool switchConnectionPending =
+        _sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET ||
+        _sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS;
     _lastA2dpStatus = status;
     if (_moduleRole == BT_ROLE_SOURCE) {
         if (status >= 2 && status <= 5) {
@@ -3182,12 +3497,12 @@ void BluetoothPlayer::handleA2dpStatus(uint32_t status) {
                 _sourceConnectedName[0] = '\0';
                 _streamCodec[0] = '\0';
                 _sourceCodecSampleRate = 0;
-                if (manualSourceConnectFailed) {
+                if (manualSourceConnectFailed && !switchConnectionPending) {
                     netserver.btSourceScanStateToWs(
                         0, "error", _sourceScanDeviceCount,
                         "Connection failed: the selected device did not accept A2DP audio. Choose a speaker/headset in pairing mode.");
                     log_w("##[BT-TX]# manual source connection rejected or unsupported by remote device");
-                } else {
+                } else if (!switchConnectionPending) {
                     netserver.btSourceScanStateToWs(
                         0, "disconnected", _sourceScanDeviceCount,
                         "Speaker disconnected");
@@ -3200,10 +3515,13 @@ void BluetoothPlayer::handleA2dpStatus(uint32_t status) {
             if (previousStatus < 3 || previousStatus > 5) {
                 _inputRefreshPending = true;
             }
-            _sourceConnectPending = false;
-            _sourceManualConnectPending = false;
-            _sourceConnectDeadlineMs = 0;
-            if (_moduleRole == BT_ROLE_SOURCE && previousStatus < 3) {
+            if (!switchConnectionPending) {
+                _sourceConnectPending = false;
+                _sourceManualConnectPending = false;
+                _sourceConnectDeadlineMs = 0;
+            }
+            if (_moduleRole == BT_ROLE_SOURCE && previousStatus < 3 &&
+                !switchConnectionPending) {
                 netserver.btSourceScanStateToWs(
                     0, "connected", _sourceScanDeviceCount,
                     "Speaker connected");
@@ -3218,22 +3536,50 @@ void BluetoothPlayer::handleA2dpStatus(uint32_t status) {
                 (previousStatus != 4 || !_inputCodec[0])) {
                 _streamInfoRequested = false;
             }
-            _sourceConnectPending = false;
-            _sourceManualConnectPending = false;
-            _sourceConnectDeadlineMs = 0;
+            if (!switchConnectionPending) {
+                _sourceConnectPending = false;
+                _sourceManualConnectPending = false;
+                _sourceConnectDeadlineMs = 0;
+            }
             if (!connected()) _state = BT_STATE_CONNECTED;
             break;
         case 5:  // firmware also reports this around media start/pause
             if (previousStatus < 3 || previousStatus > 5) {
                 _inputRefreshPending = true;
             }
-            _sourceConnectPending = false;
-            _sourceManualConnectPending = false;
-            _sourceConnectDeadlineMs = 0;
+            if (!switchConnectionPending) {
+                _sourceConnectPending = false;
+                _sourceManualConnectPending = false;
+                _sourceConnectDeadlineMs = 0;
+            }
             if (!connected()) _state = BT_STATE_CONNECTED;
             break;
         default:
             break;
+    }
+    if (switchConnectionPending) {
+        if (status == 1U && previousStatus >= 2U &&
+            previousStatus <= 5U) {
+            if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET) {
+                queueSourceSwitchRollback("A2DP returned to standby");
+            } else if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS) {
+                _sourceSwitchState = SOURCE_SWITCH_IDLE;
+                _sourceSwitchDeadlineMs = 0;
+                _sourceConnectPending = false;
+                _sourceManualConnectPending = false;
+                _sourceConnectDeadlineMs = 0;
+                publishSourceUiError(
+                    _sourceSwitchClientId,
+                    "New speaker failed; previous speaker could not be restored automatically");
+            }
+        } else if (status >= 3U && status <= 5U &&
+                   _sourceSwitchAddressReported) {
+            completeSourceSwitchConnection(_sourceConnectedAddress);
+        }
+    }
+    if (_sourceSwitchState == SOURCE_SWITCH_WAIT_ROLLBACK &&
+        status >= 3U && status <= 5U && _sourceSwitchAddressReported) {
+        completeSourceSwitchConnection(_sourceConnectedAddress);
     }
     if (sinkConnectionEstablished && config.getMode() == PM_BLUETOOTH &&
         !playing()) {
@@ -3609,6 +3955,73 @@ void BluetoothPlayer::parseLine(char* line) {
             return;
         }
 
+        if (completedCommand == SOURCE_UI_COMMAND_SWITCH_DISCONNECT) {
+            const bool cancellingTarget =
+                _sourceSwitchState == SOURCE_SWITCH_DISCONNECTING_TARGET;
+            if ((_sourceSwitchState != SOURCE_SWITCH_DISCONNECTING &&
+                 !cancellingTarget) ||
+                sourceOutputMode() == BT_SOURCE_OUTPUT_LOCAL_ONLY) {
+                return; // Output route changed while DISC was in flight.
+            }
+            if (failed) {
+                if (_lastA2dpStatus == 1) {
+                    _sourceSwitchState = cancellingTarget
+                        ? SOURCE_SWITCH_WAIT_ROLLBACK
+                        : SOURCE_SWITCH_WAIT_STANDBY;
+                    _sourceSwitchDeadlineMs = millis() + 7000U;
+                } else {
+                    _sourceSwitchState = SOURCE_SWITCH_IDLE;
+                    _sourceSwitchDeadlineMs = 0;
+                    publishSourceUiError(
+                        clientId,
+                        cancellingTarget
+                            ? "Could not cancel the new connection; reconnect the previous speaker manually"
+                            : "Bluetooth module rejected the disconnect; current speaker was kept");
+                }
+            } else {
+                _sourceSwitchState = cancellingTarget
+                    ? SOURCE_SWITCH_WAIT_TARGET_STANDBY
+                    : SOURCE_SWITCH_WAIT_STANDBY;
+                _sourceSwitchDeadlineMs = millis() + 7000U;
+                _sourceSwitchNextStatusQueryMs = millis() + 1000U;
+            }
+            return;
+        }
+
+        if (completedCommand == SOURCE_UI_COMMAND_SWITCH_QUERY_STATUS) {
+            if (failed) {
+                log_w("##[BT-TX]# switch A2DP status query rejected; waiting for state event");
+            }
+            return;
+        }
+
+        if (completedCommand == SOURCE_UI_COMMAND_CONNECT &&
+            _sourceSwitchState == SOURCE_SWITCH_WAIT_ROLLBACK) {
+            // The target already failed on an unsolicited A2DP state edge.
+            // Consume its late terminal response before starting rollback.
+            return;
+        }
+
+        if (completedCommand == SOURCE_UI_COMMAND_CONNECT &&
+            (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET ||
+             _sourceSwitchState == SOURCE_SWITCH_CONNECTING_PREVIOUS)) {
+            if (failed) {
+                if (_sourceSwitchState == SOURCE_SWITCH_CONNECTING_TARGET) {
+                    queueSourceSwitchRollback("module rejected target connection");
+                } else {
+                    _sourceSwitchState = SOURCE_SWITCH_IDLE;
+                    _sourceSwitchDeadlineMs = 0;
+                    _sourceConnectPending = false;
+                    _sourceManualConnectPending = false;
+                    _sourceConnectDeadlineMs = 0;
+                    publishSourceUiError(
+                        clientId,
+                        "New speaker failed; previous speaker could not be restored automatically");
+                }
+            }
+            return;
+        }
+
         if (failed) {
             if (completedCommand == SOURCE_UI_COMMAND_SCAN ||
                 completedCommand == SOURCE_UI_COMMAND_STOP_SCAN) {
@@ -3616,6 +4029,13 @@ void BluetoothPlayer::parseLine(char* line) {
                                  "Bluetooth module rejected the scan command");
             } else {
                 if (completedCommand == SOURCE_UI_COMMAND_CONNECT) {
+                    if (_lastA2dpStatus >= 3 && _lastA2dpStatus <= 5) {
+                        // A connection event can precede the command's final
+                        // response. Do not erase a confirmed live endpoint.
+                        log_w("##[BT-TX]# connect reply rejected after A2DP connected; retaining live device");
+                        publishSourceUiSnapshot(clientId);
+                        return;
+                    }
                     _sourceConnectPending = false;
                     _sourceManualConnectPending = false;
                     _sourceConnectDeadlineMs = 0;
@@ -3932,6 +4352,8 @@ void BluetoothPlayer::parseLine(char* line) {
         _inputConnectedName[0] = '\0';
         _sourceConnectedAddress[0] = '\0';
         _sourceConnectedName[0] = '\0';
+        _sourceSwitchState = SOURCE_SWITCH_IDLE;
+        _sourceSwitchDeadlineMs = 0;
         _sourceCodecSampleRate = 0;
         _sourceAudioPathReady = false;
         _sourceAudioEnablePending = false;
