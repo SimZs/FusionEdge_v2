@@ -241,6 +241,7 @@ class BluetoothPlayer {
     void handleLabConsole();
     void printLabHelp() const;
     void serviceStartupProbe();
+    void serviceStartupRoleReconcile();
     void serviceSourceRadioStats();
     void serviceSourceUiPlaybackState();
     void serviceSinkStreamInfo();
@@ -370,6 +371,7 @@ class BluetoothPlayer {
     uint8_t        _startupProbeStep = 0;
     uint32_t       _nextStartupProbeMs = 0;
     bool           _startupProbeComplete = false;
+    bool           _startupRoleReconcilePending = true;
 
     btState_e _state      = BT_STATE_UNKNOWN;
     btModuleRole_e _moduleRole = BT_ROLE_UNKNOWN;

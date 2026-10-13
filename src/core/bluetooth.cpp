@@ -236,6 +236,7 @@ void BluetoothPlayer::begin() {
     _startupProbeStep = 0;
     _nextStartupProbeMs = millis() + 1500U;
     _startupProbeComplete = false;
+    _startupRoleReconcilePending = true;
     __atomic_store_n(&_moduleRole, BT_ROLE_UNKNOWN, __ATOMIC_RELEASE);
     _moduleI2sCfg = -1;
     _moduleAuxCfg = -1;
@@ -362,9 +363,9 @@ void BluetoothPlayer::begin() {
     _streamBits = BT_I2S_BITS;
     delay(200);
 
-    // The lab module is configured persistently outside this firmware.
-    // Read-only startup checks are issued later by serviceStartupProbe(), one
-    // at a time, because the BT1058 may still be booting at this point.
+    // Probe the module before deciding whether its persistent role/audio
+    // settings need reconciliation with Edge's saved playback mode. Queries
+    // are staggered because the BT1058 may still be booting at this point.
 
     // I2S RX csatorna létrehozása (idle, engedélyezés nélkül — az csak
     // startBridge()-ben történik). Az I2S újrakonfigurálását a keskeny
@@ -729,6 +730,9 @@ bool BluetoothPlayer::requestRole(btModuleRole_e role,
     if (role == BT_ROLE_SINK) {
         beginSinkMetaGeneration(true);
     }
+    // A user-initiated role request during the initial probe supersedes the
+    // boot-time reconciliation. Do not issue a second transition afterwards.
+    _startupRoleReconcilePending = false;
     log_i("##[BT-ROLE]# requested %s", moduleRoleName(role));
     return true;
 }
@@ -1032,6 +1036,34 @@ void BluetoothPlayer::serviceStartupProbe() {
 
     sendAT(queries[_startupProbeStep++]);
     _nextStartupProbeMs = now + 350U;
+}
+
+void BluetoothPlayer::serviceStartupRoleReconcile() {
+    if (!_startupRoleReconcilePending || !_startupProbeComplete ||
+        _moduleRole == BT_ROLE_UNKNOWN || roleTransitionBusy()) {
+        return;
+    }
+    // Leave the final read-only probe reply time to arrive before the role
+    // state machine sends its first configuration command on the same UART.
+    if (static_cast<uint32_t>(millis() - _lastAtTxMs) <
+        BT_AT_COMMAND_GUARD_MS) {
+        return;
+    }
+
+    const btModuleRole_e desiredRole = config.getMode() == PM_BLUETOOTH
+                                           ? BT_ROLE_SINK : BT_ROLE_SOURCE;
+    if (roleConfigurationMatches(desiredRole)) {
+        _startupRoleReconcilePending = false;
+        return;
+    }
+
+    // A factory-fresh BT1058 commonly starts in sink mode even when Edge
+    // boots in WEB/SD/DLNA. Reuse the verified transition (including its
+    // persistent AUXCFG/I2SCFG checks) rather than writing AT settings here.
+    if (requestRole(desiredRole)) {
+        log_i("##[BT-ROLE]# startup mode requires %s; reconciling module",
+              moduleRoleName(desiredRole));
+    }
 }
 
 void BluetoothPlayer::serviceSourceRadioStats() {
@@ -2859,6 +2891,7 @@ void BluetoothPlayer::loop() {
     }
 
     serviceStartupProbe();
+    serviceStartupRoleReconcile();
     serviceSourceDeviceControl();
     serviceSourceRadioStats();
     serviceSourceUiPlaybackState();
@@ -2915,9 +2948,11 @@ void BluetoothPlayer::loop() {
         } else if (_moduleRole == BT_ROLE_SOURCE) {
             _bridgeStartPending = false;
             log_w("##[BT-TX]# pending RX bridge cancelled: module is source");
-        } else if (_moduleRole == BT_ROLE_UNKNOWN) {
-            // Wait for the read-only AT+MODCFG response before assigning a
-            // direction to the module-side I2S pins.
+        } else if (_moduleRole == BT_ROLE_UNKNOWN ||
+                   !_startupProbeComplete ||
+                   _startupRoleReconcilePending || roleTransitionBusy()) {
+            // Wait until the boot role and its I2S configuration have been
+            // verified before starting the receive bridge.
         } else if (!player.isRunning() && player.status() == STOPPED &&
                    player.readyForWebStation()) {
             _bridgeStartPending = false;
@@ -4692,9 +4727,8 @@ bool BluetoothPlayer::startBridge() {
 bool BluetoothPlayer::startBridgeNow() {
     if (_bridgeTaskHandle || !_rxHandle) return false;
 
-    // Read-only verification. The module's persistent settings were already
-    // established during isolated bring-up; the Edge lab must not rewrite
-    // them automatically.
+    // The role state machine owns persistent module configuration. The bridge
+    // only requests read-only stream information before starting audio.
     requestStreamInfo(true);
 
     if (_bridgeTaskHandle || !_rxHandle) return false;

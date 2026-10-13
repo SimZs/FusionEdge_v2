@@ -1,8 +1,13 @@
 # FusionEdge V2.0
 
-ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.1**.
+ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.2**.
 
 Ez a FusionEdge továbbfejlesztett, PlatformIO/Arduino-alapú firmware-e.
+
+## Mi változott a 2.0.2-ben?
+
+- Első indításkor a firmware a mentett lejátszási módhoz igazítja az FSC-BT1058 szerepét. A gyári Sink állapotú modul WEB/SD/DLNA módban magától Source módra vált; a WebUI keresőgombja a beállítás és ellenőrzés után kézi oda-vissza módváltás nélkül aktiválódik.
+- Bluetooth Input módból indulva az audióhíd megvárja a modul szerepének és I2S-beállításainak ellenőrzését.
 
 ## Mi változott a 2.0.1-ben?
 
