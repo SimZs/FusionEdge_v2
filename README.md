@@ -1,8 +1,15 @@
 # FusionEdge V2.0
 
-ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.2**.
+ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.3**.
 
 Ez a FusionEdge továbbfejlesztett, PlatformIO/Arduino-alapú firmware-e.
+
+## Mi változott a 2.0.3-ban?
+
+- A WebUI lejátszási listájában ismét működik az állomásnév szerinti keresés; a műfajok közül is lehet választani és műfajra szűrni.
+- A Wi-Fi a scanben név nélkül megjelenő, rejtett mentett hálózatokat is megpróbálja elérni. A csatlakozási várakozás hálózatonként 45 másodperc, hogy a lassabban válaszoló vagy gyenge jelű AP miatt ne induljon túl korán AP módba.
+
+A WebUI-javításhoz a firmware mellett a LittleFS-t is frissíteni kell. Full erase nem szükséges. Ha egyik mentett hálózat sem érhető el, az AP módba lépés az eddiginél tovább tarthat.
 
 ## Mi változott a 2.0.2-ben?
 

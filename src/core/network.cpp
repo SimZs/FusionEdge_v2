@@ -12,8 +12,8 @@
 #include "timekeeper.h"
 #include "../pluginsManager/pluginsManager.h"
 
-#ifndef WIFI_ATTEMPTS
-    #define WIFI_ATTEMPTS 16
+#ifndef WIFI_CONNECT_TIMEOUT_MS
+    #define WIFI_CONNECT_TIMEOUT_MS 45000
 #endif
 
 #ifndef WIFI_SCAN_TIMEOUT_MS
@@ -77,9 +77,9 @@ void MyNetwork::WiFiLostConnection(WiFiEvent_t event, WiFiEventInfo_t info) {
     WiFi.reconnect();
 }
 
-// The scan ranks visible saved SSIDs, including weak ones. A weak or hidden
-// saved network must remain a fallback, otherwise a -83 dBm workplace AP can
-// be rejected even though it is the only usable network in wifi.csv.
+// The scan ranks visible saved SSIDs, including weak ones. Hidden APs have
+// no SSID in scan results, so every unmatched saved SSID must still be tried
+// by name. Never reject a -83 dBm workplace AP based on scan RSSI alone.
 static uint8_t buildWifiCandidates(uint8_t* out, uint8_t capacity, bool silent) {
     const uint8_t savedCount = config.ssidsCount > 5 ? 5 : config.ssidsCount;
     if (!out || !capacity || !savedCount) { return 0; }
@@ -196,8 +196,11 @@ bool MyNetwork::wifiBegin(bool silent) {
         const char* password = config.ssids[index].password[0]
             ? config.ssids[index].password : nullptr;
         WiFi.begin(config.ssids[index].ssid, password);
-        // Preserve the old ~8.5 s per-network timeout for a fair weak-signal test.
-        for (uint16_t wait = 0; wait <= WIFI_ATTEMPTS && WiFi.status() != WL_CONNECTED; ++wait) {
+        // Hidden and weak APs may need longer than the old ~8.5 s limit.
+        // Time each saved SSID separately before falling back to the next one/AP mode.
+        const uint32_t connectStarted = millis();
+        while (WiFi.status() != WL_CONNECTED &&
+               millis() - connectStarted < WIFI_CONNECT_TIMEOUT_MS) {
             if (!silent) { Serial.print("."); }
             delay(500);
             if (REAL_LEDBUILTIN != 255 && !silent) {
@@ -213,8 +216,10 @@ bool MyNetwork::wifiBegin(bool silent) {
         }
         if (!silent) {
             Serial.println();
-            Serial.printf("##[WIFI]# connection failed: %s (status=%d)\n",
-                          config.ssids[index].ssid, static_cast<int>(WiFi.status()));
+            Serial.printf("##[WIFI]# connection failed: %s after %lu ms (status=%d)\n",
+                          config.ssids[index].ssid,
+                          static_cast<unsigned long>(millis() - connectStarted),
+                          static_cast<int>(WiFi.status()));
         }
     }
     WiFi.disconnect(false);
