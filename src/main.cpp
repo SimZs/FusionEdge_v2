@@ -17,8 +17,12 @@
 #endif
 #include "core/mqtt.h"
 #include "driver/rtc_io.h"
-#if CONFIG_IDF_TARGET_ESP32 && defined(BOARD_HAS_PSRAM)
+#if (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
 #    include "esp_heap_caps.h"
+#    include <atomic>
+#endif
+#if CONFIG_IDF_TARGET_ESP32S3 && defined(BOARD_HAS_PSRAM)
+#    include "mbedtls/platform.h"
 #endif
 #include "core/serial_littlefs.h"
 
@@ -99,21 +103,70 @@ extern decode_results irResults;
 static TaskHandle_t clockTtsTaskHandle = nullptr;
 static bool         serialLittlefsEnabled = true;
 
-static void configureClassicEsp32PsramAllocator() {
-#if CONFIG_IDF_TARGET_ESP32 && defined(BOARD_HAS_PSRAM)
+static void configurePsramAllocator() {
+#if (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
     if (!psramFound()) return;
 
-    // The Arduino core normally keeps allocations up to 4 KB in internal RAM.
-    // A classic ESP32-WROVER has much less internal heap than the S3, and the
-    // WebUI's concurrent LittleFS responses still need internal-only newlib,
-    // VFS and FreeRTOS locks. Move medium-sized general allocations to PSRAM
-    // early, before plugins, display widgets and networking are initialized.
+    // Keep internal-only RAM available for TLS, VFS, DMA and FreeRTOS when
+    // browser requests arrive during playback. The Arduino default favors
+    // internal RAM for general allocations up to 4 KB on both ESP32 and S3.
     heap_caps_malloc_extmem_enable(1024);
-    log_i("##[MEM]# classic ESP32 PSRAM threshold=1024 internalFree=%u largest=%u",
-          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    Serial.printf("##[MEM]# PSRAM threshold=1024 internalFree=%u largest=%u psramFree=%u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 #endif
 }
+
+#if CONFIG_IDF_TARGET_ESP32S3 && defined(BOARD_HAS_PSRAM)
+static void* tlsPsramCalloc(size_t count, size_t size) {
+    // mbedTLS record buffers are about 16 KiB. Match this IDF build's
+    // internal-only allocator for smaller requests; move only large buffers.
+    if (size != 0 && count > SIZE_MAX / size) return nullptr;
+    if (count * size >= 16 * 1024) {
+        return heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    return heap_caps_calloc(count, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+
+static void tlsPsramFree(void* ptr) {
+    heap_caps_free(ptr);
+}
+
+static void configureTlsPsramAllocator() {
+    if (!psramFound()) return;
+    const int result = mbedtls_platform_set_calloc_free(tlsPsramCalloc, tlsPsramFree);
+    Serial.printf("##[MEM]# TLS large buffers -> PSRAM result=%d\n", result);
+}
+#endif
+
+#if (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
+static std::atomic<uint32_t> failedAllocations{0};
+static std::atomic<uint32_t> lastFailedSize{0};
+static std::atomic<uint32_t> lastFailedCaps{0};
+
+static void onFailedAllocation(size_t size, uint32_t caps, const char *) {
+    // The allocator invokes this hook under memory pressure. Do not log or
+    // allocate here; report the recorded values later from the main loop.
+    lastFailedSize.store((uint32_t)size, std::memory_order_relaxed);
+    lastFailedCaps.store(caps, std::memory_order_relaxed);
+    failedAllocations.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void reportFailedAllocations() {
+    static uint32_t reported = 0;
+    const uint32_t count = failedAllocations.load(std::memory_order_relaxed);
+    if (count == reported) return;
+    reported = count;
+    Serial.printf("##[MEM]# alloc_fail count=%u lastSize=%u caps=0x%08x internalFree=%u largest=%u psramFree=%u\n",
+                  (unsigned)count,
+                  (unsigned)lastFailedSize.load(std::memory_order_relaxed),
+                  (unsigned)lastFailedCaps.load(std::memory_order_relaxed),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+#endif
 
 static bool loadSerialLittlefsEnabledFromEeprom() {
     config.eepromRead(EEPROM_START, config.store);
@@ -199,7 +252,16 @@ static bool serviceMaintenanceMode() {
 void setup() {
     Serial.begin(460800); 
     delay(100);
-    configureClassicEsp32PsramAllocator();
+    configurePsramAllocator();
+#if CONFIG_IDF_TARGET_ESP32S3 && defined(BOARD_HAS_PSRAM)
+    configureTlsPsramAllocator();
+#endif
+#if (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
+    const esp_err_t allocHookResult = heap_caps_register_failed_alloc_callback(onFailedAllocation);
+    if (allocHookResult != ESP_OK) {
+        Serial.printf("##[MEM]# alloc_fail hook registration failed: %d\n", (int)allocHookResult);
+    }
+#endif
     EEPROM.begin(EEPROM_SIZE);
     serial_littlefs_begin(Serial);
     serialLittlefsEnabled = loadSerialLittlefsEnabledFromEeprom();
@@ -327,6 +389,9 @@ void setup() {
 }
 
 void loop() {
+#if (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
+    reportFailedAllocations();
+#endif
     pm.on_loop();
     if (serviceMaintenanceMode()) return;
 

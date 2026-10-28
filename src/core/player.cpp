@@ -541,11 +541,14 @@ bool Player::_connectToHostProtected(const char* url) {
     vTaskDelay(1);
     [[maybe_unused]] const size_t largestBefore =
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psramBefore = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     connected = Audio::connecttohost(url);
-    log_i("##[PLAYER]# connect result=%d internalLargest=%u->%u", connected,
-          static_cast<unsigned>(largestBefore),
-          static_cast<unsigned>(
-              heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+    Serial.printf("##[PLAYER]# connect result=%d internalLargest=%u->%u psramFree=%u->%u\n", connected,
+                  static_cast<unsigned>(largestBefore),
+                  static_cast<unsigned>(
+                      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(psramBefore),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
   } else {
     log_w("##[PLAYER]# connect deferred: cover network did not stop");
   }

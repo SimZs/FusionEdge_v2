@@ -40,11 +40,11 @@ constexpr size_t m_frameSizeVORBIS = UINT16_MAX; // OGG length is normally 4080 
 constexpr size_t m_outbuffSize = 4608 * 2;
 constexpr size_t m_resamplesBuffSize = m_outbuffSize * 8; // SRmin: 6KHz -> SRmax: 48K
 
-constexpr size_t AUDIO_STACK_SIZE = 4500;
+constexpr size_t AUDIO_STACK_WORDS = 4500;
 
 // static allocations for Audio task
 StaticTask_t __attribute__((unused)) xAudioTaskBuffer;
-StackType_t __attribute__((unused))  xAudioStack[AUDIO_STACK_SIZE];
+StackType_t __attribute__((unused))  xAudioStack[AUDIO_STACK_WORDS];
 
 // weak default implementation - can be overridden by user
 __attribute__((weak)) void audio_process_i2s(int32_t* outBuff, int16_t validSamples, bool* continueI2S) {
@@ -4739,7 +4739,11 @@ void Audio::playAudioData() {
                 }
             }
             if (m_pad.lastFrames) {
-                m_pad.bytesToDecode = min(InBuff.readSpace(), (size_t)(m_audioDataStart + m_audioDataSize - m_audioDataReadPtr));
+                // TTS responses may not carry a file size. Drain the received
+                // buffer instead of treating the remaining length as zero.
+                m_pad.bytesToDecode = m_f_tts
+                    ? InBuff.readSpace()
+                    : min(InBuff.readSpace(), (size_t)(m_audioDataStart + m_audioDataSize - m_audioDataReadPtr));
                 m_pad.bytesDecoded = sendBytes(InBuff.getReadPtr(), m_pad.bytesToDecode);
             } else {
                 m_pad.bytesToDecode = InBuff.readSpace();
@@ -7820,7 +7824,7 @@ void Audio::startAudioTask() {
 
     m_audioTaskHandle = xTaskCreateStaticPinnedToCore(&Audio::audioTaskWrapper, /* Function to implement the task */
                                                       "PeriodicTask",           /* Name of the task */
-                                                      AUDIO_STACK_SIZE,         /* Stack size in words */
+                                                      sizeof(xAudioStack),      /* ESP-IDF expects stack size in bytes */
                                                       this,                     /* Task input parameter */
                                                       4,                        /* Priority of the task - FusionEdge: 4 (high bitrate FLAC) */
                                                       xAudioStack,              /* Task stack */
@@ -7879,6 +7883,6 @@ void Audio::performAudioTask() {
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
 uint32_t Audio::getHighWatermark() {
     UBaseType_t highWaterMark = uxTaskGetStackHighWaterMark(m_audioTaskHandle);
-    return highWaterMark; // dwords
+    return highWaterMark; // ESP-IDF reports bytes
 }
 // —————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————

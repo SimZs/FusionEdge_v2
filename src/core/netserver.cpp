@@ -1,7 +1,7 @@
 // clang-format off
 #include "options.h"
 #include "Arduino.h"
-#if CONFIG_IDF_TARGET_ESP32
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3
   #include "esp_heap_caps.h"
 #endif
 #include <LittleFS.h>
@@ -64,6 +64,32 @@ AsyncWebServer webserver(80);
 AsyncWebSocket websocket("/ws");
 
 namespace {
+struct CachedWebAsset {
+  uint8_t *data = nullptr;
+  size_t size = 0;
+};
+
+CachedWebAsset cacheGzipAsset(const char *path, bool available) {
+#if (CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3) && defined(BOARD_HAS_PSRAM)
+  if (!available || !psramFound()) return {};
+  File file = LittleFS.open(path, "r");
+  if (!file) return {};
+  const size_t size = file.size();
+  if (size == 0 || size > 32768) return {};
+  auto *data = static_cast<uint8_t *>(heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!data) return {};
+  if (file.read(data, size) != size) {
+    free(data);
+    return {};
+  }
+  return {data, size}; // Kept for the web server's lifetime.
+#else
+  (void)path;
+  (void)available;
+  return {};
+#endif
+}
+
 void copyJsonEscaped(const char* input, char* output, size_t outputSize) {
   if (!output || outputSize == 0) return;
   size_t out = 0;
@@ -924,11 +950,31 @@ bool NetServer::begin(bool quiet) {
   const bool themeGzip = LittleFS.exists("/www/theme.css.gz");
   const bool dragPlain = LittleFS.exists("/www/dragpl.js");
   const bool dragGzip = LittleFS.exists("/www/dragpl.js.gz");
+  const bool optionsPlain = LittleFS.exists("/www/options.html");
+  const bool optionsGzip = LittleFS.exists("/www/options.html.gz");
+
+  // These small, frequently requested files otherwise keep several LittleFS
+  // handles and VFS locks open while HTTPS audio is using internal RAM.
+  static CachedWebAsset scriptCache;
+  static CachedWebAsset styleCache;
+  static CachedWebAsset themeCache;
+  static CachedWebAsset dragCache;
+  static CachedWebAsset optionsCache;
+  if (!scriptCache.data) scriptCache = cacheGzipAsset("/www/script.js.gz", scriptGzip && !scriptPlain);
+  if (!styleCache.data) styleCache = cacheGzipAsset("/www/style.css.gz", styleGzip && !stylePlain);
+  if (!themeCache.data) themeCache = cacheGzipAsset("/www/theme.css.gz", themeGzip && !themePlain);
+  if (!dragCache.data) dragCache = cacheGzipAsset("/www/dragpl.js.gz", dragGzip && !dragPlain);
+  if (!optionsCache.data) optionsCache = cacheGzipAsset("/www/options.html.gz", optionsGzip && !optionsPlain);
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3
+  Serial.printf("##[WEBMEM]# cached gzip in PSRAM=%u bytes\n",
+                (unsigned)(scriptCache.size + styleCache.size + themeCache.size +
+                           dragCache.size + optionsCache.size));
+#endif
 
   auto sendWebFile = [](AsyncWebServerRequest *request, const char *plainPath,
                         const char *gzipPath, const char *contentType,
-                        bool plainAvailable, bool gzipAvailable) {
-#if CONFIG_IDF_TARGET_ESP32
+                        bool plainAvailable, bool gzipAvailable, CachedWebAsset cachedGzip) {
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3
     const size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (internalFree < 24576) {
       log_w("##[WEBMEM]# low internal heap path='%s' free=%u largest=%u",
@@ -941,7 +987,9 @@ bool NetServer::begin(bool quiet) {
       return;
     }
     if (gzipAvailable) {
-      AsyncWebServerResponse *response = request->beginResponse(LittleFS, gzipPath, contentType);
+      AsyncWebServerResponse *response = cachedGzip.data
+          ? request->beginResponse_P(200, contentType, cachedGzip.data, cachedGzip.size)
+          : request->beginResponse(LittleFS, gzipPath, contentType);
       response->addHeader("Content-Encoding", "gzip");
       request->send(response);
       return;
@@ -952,19 +1000,32 @@ bool NetServer::begin(bool quiet) {
   // Explicit handlers for critical UI assets to avoid stalled static responses on some builds.
   webserver.on("/script.js", HTTP_GET, [sendWebFile, scriptPlain, scriptGzip](AsyncWebServerRequest *request) {
     sendWebFile(request, "/www/script.js", "/www/script.js.gz", "application/javascript",
-                scriptPlain, scriptGzip);
+                scriptPlain, scriptGzip, scriptCache);
   });
   webserver.on("/style.css", HTTP_GET, [sendWebFile, stylePlain, styleGzip](AsyncWebServerRequest *request) {
     sendWebFile(request, "/www/style.css", "/www/style.css.gz", "text/css",
-                stylePlain, styleGzip);
+                stylePlain, styleGzip, styleCache);
   });
   webserver.on("/theme.css", HTTP_GET, [sendWebFile, themePlain, themeGzip](AsyncWebServerRequest *request) {
     sendWebFile(request, "/www/theme.css", "/www/theme.css.gz", "text/css",
-                themePlain, themeGzip);
+                themePlain, themeGzip, themeCache);
   });
   webserver.on("/dragpl.js", HTTP_GET, [sendWebFile, dragPlain, dragGzip](AsyncWebServerRequest *request) {
     sendWebFile(request, "/www/dragpl.js", "/www/dragpl.js.gz", "application/javascript",
-                dragPlain, dragGzip);
+                dragPlain, dragGzip, dragCache);
+  });
+
+  // Record the internal-heap headroom at the start of the settings-page load.
+  // This page immediately triggers several WebSocket and LittleFS requests.
+  webserver.on("/options.html", HTTP_GET, [sendWebFile, optionsPlain, optionsGzip](AsyncWebServerRequest *request) {
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3
+    Serial.printf("##[WEBMEM]# options page internalFree=%u largest=%u psramFree=%u\n",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#endif
+    sendWebFile(request, "/www/options.html", "/www/options.html.gz", "text/html",
+                optionsPlain, optionsGzip, optionsCache);
   });
 
 #ifdef USE_DLNA
@@ -1519,6 +1580,12 @@ void NetServer::processQueue() {
 
       case GETSYSTEM:
       {
+#if CONFIG_IDF_TARGET_ESP32 || CONFIG_IDF_TARGET_ESP32S3
+        Serial.printf("##[WEBMEM]# settings data internalFree=%u largest=%u psramFree=%u\n",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+#endif
         uint8_t quietFromH = static_cast<uint8_t>((config.store.clockTtsQuietFromMinutes / 60) % 24);
         uint8_t quietFromM = static_cast<uint8_t>(config.store.clockTtsQuietFromMinutes % 60);
         uint8_t quietToH = static_cast<uint8_t>((config.store.clockTtsQuietToMinutes / 60) % 24);

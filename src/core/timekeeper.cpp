@@ -676,6 +676,13 @@ void TimeKeeper::_upClock() {
 
 void TimeKeeper::_upScreensaver() {
     if (!display.ready()) { return; }
+    // The equalizer is an overlay on PLAYER, not a separate display mode.
+    // Keep both idle timers stopped while the user is adjusting it.
+    if (display.mode() == PLAYER && display.isEqOpen()) {
+        config.screensaverTicks = 0;
+        config.screensaverPlayingTicks = 0;
+        return;
+    }
     const bool playbackActive = config.isPlaybackActive();
     if (config.store.screensaverEnabled && display.mode() == PLAYER && (!playbackActive || config.store.volume == 0)) { // "PWR_AMP"
         config.screensaverTicks++;

@@ -1663,6 +1663,14 @@ static bool isLowerMenuMode(displayMode_e mode) {
 }
 
 void Display::_swichMode(displayMode_e newmode) {
+    // A timer request may already be queued when the EQ overlay opens.
+    // Never replace an active tone adjustment with the screensaver.
+    if ((newmode == SCREENSAVER || newmode == SCREENBLANK) &&
+        _mode == PLAYER && isEqOpen()) {
+        config.screensaverTicks = 0;
+        config.screensaverPlayingTicks = 0;
+        return;
+    }
 #    ifdef USE_NEXTION
     nextion.putRequest({NEWMODE, newmode});
 #    endif

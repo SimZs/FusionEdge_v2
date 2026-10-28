@@ -1,8 +1,17 @@
 # FusionEdge V2.0
 
-ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.3**.
+ESP32-S3 alapú internetes rádió, helyi és hálózati lejátszással, valamint kétirányú Bluetooth-audióval. Aktuális kiadás: **v2.0.4**.
 
 Ez a FusionEdge továbbfejlesztett, PlatformIO/Arduino-alapú firmware-e.
+
+## Mi változott a 2.0.4-ben?
+
+- Stabilabb HTTPS-rádiólejátszás: az ESP32-S3 nagy TLS-pufferei PSRAM-ba kerülnek, a WebUI tömörített alaperőforrásai pedig PSRAM-ból szolgálhatók ki. Ez mérsékli a belső memória terhelését a beállítások megnyitásakor és borítókép-letöltés közben.
+- Az audiofeladat a lefoglalt verem teljes méretét használja, így a TLS-es újracsatlakozás nem fut bele a korábbi veremőrző hibába.
+- Az óránkénti, `:00` perckor elnémuló TTS javítva; a képernyővédő órájának másodpercei frissülnek.
+- Nyitott hangszínszabályzóra nem lép rá az automatikus képernyővédő. Bezárás után újraindul az időzítése.
+
+Ha már a 2.0.3 LittleFS-adatállománya van a készüléken, ehhez a kiadáshoz elég a firmware-t frissíteni; teljes törlés nem szükséges. A kiadás forráskódot tartalmaz, előre fordított firmware-t és személyes konfigurációt nem.
 
 ## Mi változott a 2.0.3-ban?
 
